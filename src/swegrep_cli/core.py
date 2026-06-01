@@ -43,6 +43,15 @@ def _auto_discover_api_key() -> str | None:
 
 def get_api_key(api_key: str | None = None, *, save_discovered: bool = True) -> str:
     if api_key:
+        if not credentials.looks_truncated_api_key(api_key):
+            return api_key
+        discovered = _auto_discover_api_key()
+        if discovered:
+            print(
+                "[swegrep-cli] Passed API key looks truncated; using key discovered from Windsurf",
+                file=sys.stderr,
+            )
+            return discovered
         return api_key
     key = os.environ.get(credentials.CONFIG_KEY)
     if key:
@@ -425,9 +434,70 @@ def check_auth(
         }
 
 
+# --- JWT Cache ---
+_jwt_cache: dict[str, tuple[str, float]] = {}
+
+
+def _get_jwt_exp(jwt: str) -> float:
+    try:
+        parts = jwt.split(".")
+        if len(parts) < 2:
+            return 0.0
+        payload_b64 = parts[1]
+        payload_b64 += "=" * (4 - len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+        return float(payload.get("exp", 0.0))
+    except Exception:
+        return 0.0
+
+
+def fetch_jwt(api_key: str, timeout_ms: int = 30000) -> str:
+    meta = ProtobufEncoder()
+    meta.write_string(1, WS_APP)
+    meta.write_string(2, _ws_app_version())
+    meta.write_string(3, api_key)
+    meta.write_string(4, "zh-cn")
+    meta.write_string(7, _ws_ls_version())
+    meta.write_string(12, WS_APP)
+    meta.write_bytes(30, b"\x00\x01")
+
+    outer = ProtobufEncoder()
+    outer.write_message(1, meta)
+
+    resp = _unary_request(
+        f"{AUTH_BASE}/GetUserJwt",
+        outer.to_bytes(),
+        compress=False,
+        timeout=timeout_ms / 1000.0,
+    )
+    for s in extract_strings(resp):
+        if s.startswith("eyJ") and "." in s:
+            return s
+    raise RuntimeError("Failed to extract JWT from GetUserJwt response")
+
+
+async def get_cached_jwt(api_key: str, timeout_ms: int = 30000) -> str:
+    now = time.time()
+    cached = _jwt_cache.get(api_key)
+    if cached:
+        token, expires_at = cached
+        if expires_at > now + 60:
+            return token
+
+    token = await asyncio.to_thread(fetch_jwt, api_key, timeout_ms)
+    exp = _get_jwt_exp(token)
+    expires_at = exp if exp > 0 else now + 3600
+    _jwt_cache[api_key] = (token, expires_at)
+    return token
+
+
+
+
+
 # --- Protobuf request builders ---
 def _build_metadata(
     api_key: str,
+    jwt: str,
     app_version: str | None = None,
     ls_version: str | None = None,
 ) -> ProtobufEncoder:
@@ -464,7 +534,7 @@ def _build_metadata(
     }
     meta.write_string(8, json.dumps(cpu_info))
     meta.write_string(12, WS_APP)
-    meta.write_string(21, api_key)
+    meta.write_string(21, jwt)
     meta.write_bytes(30, b"\x00\x01")
     return meta
 
@@ -496,13 +566,14 @@ def _build_chat_message(
 
 def _build_request(
     api_key: str,
+    jwt: str,
     messages: list[dict[str, Any]],
     tool_defs: str,
     app_version: str | None = None,
     ls_version: str | None = None,
 ) -> bytes:
     req = ProtobufEncoder()
-    req.write_message(1, _build_metadata(api_key, app_version, ls_version))
+    req.write_message(1, _build_metadata(api_key, jwt, app_version, ls_version))
 
     for m in messages:
         opts = {
@@ -844,6 +915,15 @@ async def search(
 
     # Credentials
     api_key = get_api_key(api_key)
+    jwt = await get_cached_jwt(api_key, timeout_ms)
+
+    # Overwrite timeout_ms if TIMEOUT env var is set
+    env_timeout = os.environ.get("TIMEOUT")
+    if env_timeout:
+        try:
+            timeout_ms = int(env_timeout)
+        except ValueError:
+            pass
 
     executor = ToolExecutor(
         project_root, result_max_lines=result_max_lines, line_max_chars=line_max_chars
@@ -880,7 +960,7 @@ async def search(
 
         log(f"Turn {turn + 1}/{total_api_calls + compensated_turns}")
 
-        proto = _build_request(api_key, messages, tool_defs, app_version, ls_version)
+        proto = _build_request(api_key, jwt, messages, tool_defs, app_version, ls_version)
 
         try:
             resp_data = await asyncio.to_thread(
@@ -899,7 +979,7 @@ async def search(
                 log(f"{e.code} on turn {turn + 1}: trimming context and retrying...")
                 _trim_messages(messages)
                 retry_proto = _build_request(
-                    api_key, messages, tool_defs, app_version, ls_version
+                    api_key, jwt, messages, tool_defs, app_version, ls_version
                 )
                 try:
                     resp_data = await asyncio.to_thread(

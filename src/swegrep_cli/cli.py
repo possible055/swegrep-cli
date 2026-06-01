@@ -5,12 +5,46 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import os
 from swegrep_cli.core import search
 from swegrep_cli.credentials import (
     extract_key,
+    get_config_path,
     mask_api_key,
     save_cached_api_key,
 )
+
+
+def load_skill_env() -> None:
+    try:
+        config_dir = get_config_path().parent
+        env_path = config_dir / ".env"
+        if env_path.is_file():
+            with env_path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip()
+                        if (v.startswith('"') and v.endswith('"')) or (
+                            v.startswith("'") and v.endswith("'")
+                        ):
+                            v = v[1:-1]
+                        if not k:
+                            continue
+                        if k == "API_KEY":
+                            os.environ["WINDSURF_API_KEY"] = v
+                        elif k == "TIMEOUT":
+                            try:
+                                ms = int(float(v) * 1000)
+                                os.environ["TIMEOUT"] = str(ms)
+                            except ValueError:
+                                pass
+                        else:
+                            os.environ[k] = v
+    except Exception:
+        pass
 
 
 def _require_rg() -> None:
@@ -41,6 +75,28 @@ class CustomArgumentParser(argparse.ArgumentParser):
 
 
 def main() -> None:
+    load_skill_env()
+
+    default_depth = 4
+    env_depth = os.environ.get("DEPTH")
+    if env_depth:
+        try:
+            val = int(env_depth)
+            if val in range(3, 7):
+                default_depth = val
+        except ValueError:
+            pass
+
+    default_turns = 3
+    env_turns = os.environ.get("TURNS")
+    if env_turns:
+        try:
+            val = int(env_turns)
+            if val in range(3, 6):
+                default_turns = val
+        except ValueError:
+            pass
+
     parser = CustomArgumentParser(prog="swegrep-cli")
     subparsers = parser.add_subparsers(
         dest="command", required=True, parser_class=CustomArgumentParser
@@ -59,16 +115,16 @@ def main() -> None:
     search_parser.add_argument(
         "--depth",
         type=int,
-        default=4,
+        default=default_depth,
         choices=range(3, 7),
-        help="Directory tree depth for initial repo map (3-6). Default is 4.",
+        help=f"Directory tree depth for initial repo map (3-6). Default is {default_depth}.",
     )
     search_parser.add_argument(
         "--turns",
         type=int,
-        default=3,
+        default=default_turns,
         choices=range(3, 6),
-        help="Maximum search rounds. Default is 3.",
+        help=f"Maximum search rounds. Default is {default_turns}.",
     )
 
     # Subcommand: extract-key
@@ -112,7 +168,18 @@ def main() -> None:
         def progress_callback(msg: str) -> None:
             print(f"[fast-context] {msg}", file=sys.stderr, flush=True)
 
-
+        exclude_patterns = []
+        try:
+            config_dir = get_config_path().parent
+            exclude_file = config_dir / "exclude.txt"
+            if exclude_file.is_file():
+                with exclude_file.open(encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            exclude_patterns.append(line)
+        except Exception as e:
+            print(f"Warning: Failed to read exclude file: {e}", file=sys.stderr)
 
         async def run_search() -> int:
             try:
@@ -123,6 +190,7 @@ def main() -> None:
                     api_key=args.api_key,
                     max_turns=args.turns,
                     tree_depth=args.depth,
+                    exclude_paths=exclude_patterns,
                     on_progress=progress_callback,
                 )
 

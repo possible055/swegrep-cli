@@ -109,9 +109,11 @@ def test_get_repo_map_uses_untruncated_tree() -> None:
         assert result["size_bytes"] == len(result["tree"].encode("utf-8"))
 
 
+@patch("swegrep_cli.core.get_cached_jwt", return_value="mocked.jwt.token")
 @patch("swegrep_cli.core._streaming_request")
 def test_search_loop_success(
     mock_streaming: MagicMock,
+    mock_get_jwt: MagicMock,
 ) -> None:
 
     # Turn 1: request returns restricted_exec call
