@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+*.egg
+
+# Virtual environment / Package manager
+.venv/
+.uv-cache/
+node_modules/
+
+# Build / Distribution
+build/
+dist/
+*.tsbuildinfo
+
+# Testing / Coverage / Linter / Type checker
+.pytest_cache/
+.coverage
+.pylint.d/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+
+# IDE / Editor / AI agent
+.vscode/
+.cursor/
+.claude/
+.codex/
+.codebuddy/
+.kilocode/
+.kiro/
+.gemini/
+.agent/
+.augment/
+.junie/
+AGENTS.md
+CLAUDE.md
+
+# Project-specific
+.lock-index/
+.import_linter_cache
+.dev
+.repos
+
+# Logs / Env
+*.log
+.env
+!.env.example

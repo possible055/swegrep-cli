@@ -1,0 +1,62 @@
+minimum_pre_commit_version: "4.5.0"
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+default_language_version:
+  python: python3.11
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-ast
+      - id: debug-statements
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+      - id: check-added-large-files
+        args: ["--maxkb=1500"]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: detect-private-key
+
+  # Ruff — format first, then lint
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      - id: ruff-format
+        types: [python]
+      - id: ruff-check
+        args: ["--fix"]
+        types: [python]
+
+  - repo: local
+    hooks:
+      # uv lockfile sync — ensure uv.lock matches pyproject.toml
+      - id: uv-lock-check
+        name: uv lock check
+        entry: uv lock --locked
+        language: system
+        files: '(pyproject\.toml|uv\.lock)$'
+        pass_filenames: false
+
+      # Python type check — dmypy daemon
+      - id: dmypy
+        name: mypy (dmypy daemon)
+        entry: uv run --frozen --group dev -- dmypy
+        language: system
+        args:
+          ["run", "--timeout", "7200", "--", "--config-file=pyproject.toml", "--cache-fine-grained", "--no-error-summary", "src/swegrep_cli"]
+        files: '^(src/.*\.py|pyproject\.toml)$'
+        pass_filenames: false
+        require_serial: true
+
+      # Python security scan — keep src/ as the local security boundary
+      - id: bandit
+        name: bandit (src)
+        entry: uv run --group dev -- bandit -r src/ -c pyproject.toml
+        language: system
+        files: '^(src/.*\.py|pyproject\.toml)$'
+        pass_filenames: false
