@@ -191,3 +191,24 @@ pub async fn get_cached_jwt(api_key: &str, timeout_ms: u64) -> Result<String, Fa
     }
     Ok(token)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    #[test]
+    fn jwt_exp_decodes_payload() {
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"exp":12345}"#);
+        assert_eq!(get_jwt_exp(&format!("header.{payload}.sig")), 12345.0);
+        assert_eq!(get_jwt_exp("not-a-jwt"), 0.0);
+    }
+
+    #[test]
+    fn check_auth_success_with_explicit_key() {
+        let result = check_auth(Some("fake-api-key"), None, None);
+        assert!(result.ok);
+        assert_eq!(result.jwt_source, "api-key");
+    }
+}

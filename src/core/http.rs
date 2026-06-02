@@ -195,3 +195,19 @@ pub(super) async fn streaming_request(
         FastContextError::new("Streaming request failed", "NETWORK_ERROR", Value::Null)
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protobuf::gzip_compress;
+
+    #[test]
+    fn decode_unary_response_decompresses_gzip() {
+        let data = gzip_compress(b"proto-response").unwrap();
+        assert_eq!(
+            decode_unary_response(&data, Some("gzip")),
+            b"proto-response"
+        );
+        assert_eq!(decode_unary_response(&data, None), b"proto-response");
+    }
+}

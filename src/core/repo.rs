@@ -375,3 +375,129 @@ fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     }
     merged
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::path_filter::PathFilterConfig;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn parse_answer_filters_path_traversal() {
+        let xml = r#"
+        Some thoughts first.
+        <ANSWER>
+          <file path="/codebase/src/main.py">
+            <range>10-20</range>
+            <range>30-40</range>
+          </file>
+          <file path="/codebase/tests/test_main.py">
+            <range>1-5</range>
+          </file>
+          <file path="/codebase/../../etc/passwd">
+            <range>1-2</range>
+          </file>
+        </ANSWER>
+        "#;
+        let tmp = TempDir::new().unwrap();
+        let result = parse_answer(xml, tmp.path());
+        assert_eq!(result.files.len(), 2);
+        assert_eq!(result.files[0].path, "src/main.py");
+        assert_eq!(result.files[0].ranges, vec![(10, 20), (30, 40)]);
+        assert_eq!(result.files[1].path, "tests/test_main.py");
+        assert_eq!(result.files[1].ranges, vec![(1, 5)]);
+    }
+
+    #[test]
+    fn range_map_merges_ranges_and_rejects_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let mut range_map = RangeMap::default();
+        range_map.add_range("/codebase/src/lib.rs", 10, 20);
+        range_map.add_range("src/lib.rs", 18, 30);
+        range_map.add_range("/codebase/src/lib.rs", 31, 35);
+        range_map.add_range("/codebase/../../etc/passwd", 1, 2);
+        range_map.add_range("/codebase/src/main.rs", 2, 2);
+
+        let result = range_map.to_result(tmp.path(), 10);
+
+        assert_eq!(result.files.len(), 2);
+        assert_eq!(result.files[0].path, "src/lib.rs");
+        assert_eq!(result.files[0].ranges, vec![(10, 35)]);
+        assert_eq!(result.files[1].path, "src/main.rs");
+        assert_eq!(result.files[1].ranges, vec![(2, 2)]);
+    }
+
+    #[test]
+    fn parse_range_map_answer_merges_final_xml_and_limits_results() {
+        let tmp = TempDir::new().unwrap();
+        let mut range_map = RangeMap::default();
+        range_map.add_range("/codebase/src/a.rs", 1, 3);
+        range_map.add_range("/codebase/src/b.rs", 5, 6);
+
+        let result = parse_range_map_answer(
+            r#"<ANSWER><file path="/codebase/src/a.rs"><range>4-8</range></file><file path="/codebase/src/c.rs"><range>1-1</range></file></ANSWER>"#,
+            tmp.path(),
+            &range_map,
+            2,
+        );
+
+        assert_eq!(result.files.len(), 2);
+        assert_eq!(result.files[0].path, "src/a.rs");
+        assert_eq!(result.files[0].ranges, vec![(1, 8)]);
+        assert_eq!(result.files[1].path, "src/b.rs");
+    }
+
+    #[test]
+    fn get_repo_map_uses_untruncated_manifest() {
+        let tmp = TempDir::new().unwrap();
+        for i in 0..60 {
+            fs::write(tmp.path().join(format!("file_{i:03}.txt")), "").unwrap();
+        }
+
+        let result = get_repo_map(tmp.path(), 1, &PathFilterConfig::default());
+        assert!(!result.tree.contains("... (lines truncated) ..."));
+        assert!(result.tree.contains("file_059.txt"));
+        assert_eq!(result.size_bytes, result.tree.len());
+    }
+
+    #[test]
+    fn get_repo_map_falls_back_to_compact_scope_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        for i in 0..6_000 {
+            fs::write(
+                tmp.path().join(format!(
+                    "very_long_file_name_for_scope_snapshot_padding_{i:05}.txt"
+                )),
+                "",
+            )
+            .unwrap();
+        }
+        fs::write(tmp.path().join("src").join("lib.rs"), "").unwrap();
+
+        let result = get_repo_map(tmp.path(), 4, &PathFilterConfig::default());
+
+        assert!(result.size_bytes <= MAX_TREE_BYTES);
+        assert!(result.fell_back);
+        assert!(result.tree.starts_with("/codebase"));
+        assert!(result.tree.lines().any(|line| line == "src/"));
+    }
+
+    #[test]
+    fn get_repo_map_uses_manifest_path_format() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+        fs::write(tmp.path().join("src").join("main.rs"), "").unwrap();
+
+        let result = get_repo_map(tmp.path(), 2, &PathFilterConfig::default());
+        let lines = result.tree.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines[0], "/codebase");
+        assert!(lines.contains(&"Cargo.toml"));
+        assert!(lines.contains(&"src/"));
+        assert!(lines.contains(&"src/main.rs"));
+        assert!(!lines.contains(&"/codebase/src/main.rs"));
+    }
+}

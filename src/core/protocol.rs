@@ -502,3 +502,163 @@ pub(crate) fn trim_messages(messages: &mut Vec<ChatMessage>) -> bool {
     messages.extend(tail);
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protobuf::{ProtobufEncoder, connect_frame_encode};
+
+    #[test]
+    fn trim_messages_keeps_head_bridge_and_tail() {
+        let mut messages = vec![
+            ChatMessage::simple(5, "system"),
+            ChatMessage::simple(1, "user"),
+            ChatMessage::simple(2, "thinking 1"),
+            ChatMessage::simple(4, "result 1"),
+            ChatMessage::simple(2, "thinking 2"),
+            ChatMessage::simple(4, "result 2"),
+        ];
+
+        assert!(trim_messages(&mut messages));
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0].content, "system");
+        assert_eq!(messages[1].content, "user");
+        assert!(messages[2].content.contains("omitted"));
+        assert_eq!(messages[3].content, "thinking 2");
+        assert_eq!(messages[4].content, "result 2");
+    }
+
+    #[test]
+    fn build_system_prompt_uses_windsurf_context_subagent_contract() {
+        let prompt = build_system_prompt(3, 6, 5);
+
+        assert!(prompt.contains("You are an expert software engineer"));
+        assert!(prompt.contains("Tool access: use the restricted_exec tool ONLY"));
+        assert!(prompt.contains("/codebase"));
+        assert!(prompt.contains("ANSWER FORMAT"));
+        assert!(prompt.contains("at most 6 commands"));
+        assert!(prompt.contains("at most 3 turns"));
+        assert!(prompt.contains("Think step-by-step"));
+        assert!(prompt.contains("DO NOT EVER USE MORE THAN 6 commands"));
+        assert!(prompt.contains("ls: List files in a directory"));
+        assert!(prompt.contains("glob: Find files matching a glob pattern"));
+        assert!(prompt.contains("[TOOL_CALLS]restricted_exec[ARGS]"));
+        assert!(!prompt.contains("task_boundary"));
+        assert!(!prompt.contains("notify_user"));
+    }
+
+    #[test]
+    fn final_force_answer_prompt_matches_windsurf_source() {
+        assert_eq!(
+            FINAL_FORCE_ANSWER,
+            "You have no turns left. Now you MUST provide your final ANSWER, even if it's not complete."
+        );
+        assert!(FINAL_FORCE_ANSWER.contains("MUST"));
+        assert!(FINAL_FORCE_ANSWER.contains("not complete"));
+    }
+
+    #[test]
+    fn tool_definitions_expose_only_restricted_exec_and_answer() {
+        let defs: serde_json::Value = serde_json::from_str(&get_tool_definitions(8)).unwrap();
+        let tools = defs.as_array().unwrap();
+
+        let names = tools
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["restricted_exec", "answer"]);
+
+        let schema = &tools[0]["function"]["parameters"]["properties"];
+        assert!(schema.get("command1").is_some());
+        assert!(schema.get("command8").is_some());
+        assert!(schema.get("command9").is_none());
+
+        let serialized = serde_json::to_string(&defs).unwrap();
+        assert!(serialized.contains("\"rg\""));
+        assert!(serialized.contains("\"readfile\""));
+        assert!(serialized.contains("\"tree\""));
+        assert!(serialized.contains("\"ls\""));
+        assert!(serialized.contains("\"glob\""));
+    }
+
+    #[test]
+    fn parse_response_extracts_text_tool_call() {
+        let mut encoder = ProtobufEncoder::new();
+        encoder.write_string(1, "thinking");
+        encoder.write_string(
+            2,
+            r#"[TOOL_CALLS]restricted_exec[ARGS]{"command1":{"type":"rg","pattern":"main","path":"/codebase/src"}}"#,
+        );
+        let frame = connect_frame_encode(&encoder.to_bytes(), false);
+
+        let ParsedModelTurn::ToolCalls { thinking, calls } = parse_response(&frame) else {
+            panic!("expected tool call");
+        };
+        assert_eq!(thinking, "thinking");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "restricted_exec");
+        assert_eq!(calls[0].args["command1"]["type"], "rg");
+        assert_eq!(calls[0].args["command1"]["pattern"], "main");
+    }
+
+    #[test]
+    fn parse_response_extracts_structured_restricted_exec() {
+        let frame = connect_frame_encode(
+            br#"{"output":"thinking","tool_calls":[{"id":"a","name":"restricted_exec","args":{"command1":{"type":"glob","pattern":"**/*.rs","path":"/codebase","type_filter":"file"},"command2":{"type":"readfile","file":"/codebase/src/lib.rs","start_line":1,"end_line":20}}}]}"#,
+            false,
+        );
+
+        let ParsedModelTurn::ToolCalls { thinking, calls } = parse_response(&frame) else {
+            panic!("expected structured tool calls");
+        };
+
+        assert_eq!(thinking, "thinking");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "a");
+        assert_eq!(calls[0].name, "restricted_exec");
+        assert_eq!(calls[0].args["command1"]["type"], "glob");
+        assert_eq!(calls[0].args["command2"]["type"], "readfile");
+        assert_eq!(calls[0].args["command2"]["file"], "/codebase/src/lib.rs");
+    }
+
+    #[test]
+    fn parse_response_extracts_answer_tool_call() {
+        let mut encoder = ProtobufEncoder::new();
+        encoder.write_string(
+            1,
+            r#"[TOOL_CALLS]answer[ARGS]{"answer":"<ANSWER></ANSWER>"}"#,
+        );
+        let frame = connect_frame_encode(&encoder.to_bytes(), false);
+
+        let ParsedModelTurn::ToolCalls { calls, .. } = parse_response(&frame) else {
+            panic!("expected answer");
+        };
+        assert_eq!(calls[0].name, "answer");
+        assert_eq!(calls[0].args["answer"], "<ANSWER></ANSWER>");
+    }
+
+    #[test]
+    fn parse_response_handles_error_frame() {
+        let frame = connect_frame_encode(
+            br#"{"error":{"code":"TIMEOUT","message":"request timed out"}}"#,
+            false,
+        );
+
+        assert_eq!(
+            parse_response(&frame),
+            ParsedModelTurn::Error("[Error] TIMEOUT: request timed out".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_response_returns_text_without_tool_call() {
+        let mut encoder = ProtobufEncoder::new();
+        encoder.write_string(1, "plain model text");
+        let frame = connect_frame_encode(&encoder.to_bytes(), false);
+
+        assert_eq!(
+            parse_response(&frame),
+            ParsedModelTurn::Text("plain model text".to_string())
+        );
+    }
+}
