@@ -390,7 +390,7 @@ Remember: Prefer narrow, fixed-string, and type-filtered searches with aggressiv
 "#;
 
 pub(crate) const FINAL_FORCE_ANSWER: &str =
-    "You have no turns left. Now you MUST provide your final ANSWER, even if it's not complete.";
+    "No search turns remain. You MUST call the answer tool now, even if the answer is incomplete.";
 
 pub fn get_tool_definitions(max_commands: usize) -> String {
     let max_commands = max_commands.clamp(1, 8);
@@ -551,10 +551,11 @@ mod tests {
     fn final_force_answer_prompt_matches_windsurf_source() {
         assert_eq!(
             FINAL_FORCE_ANSWER,
-            "You have no turns left. Now you MUST provide your final ANSWER, even if it's not complete."
+            "No search turns remain. You MUST call the answer tool now, even if the answer is incomplete."
         );
         assert!(FINAL_FORCE_ANSWER.contains("MUST"));
-        assert!(FINAL_FORCE_ANSWER.contains("not complete"));
+        assert!(FINAL_FORCE_ANSWER.contains("answer tool"));
+        assert!(FINAL_FORCE_ANSWER.contains("incomplete"));
     }
 
     #[test]

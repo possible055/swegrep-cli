@@ -132,10 +132,13 @@ where
     ];
 
     let total_api_calls = options.max_turns + 1;
+    const MAX_COMPENSATED_TURNS: usize = 2;
     let mut force_answer_injected = false;
     let mut range_map = RangeMap::default();
+    let mut compensated_turns = 0_usize;
+    let mut turn = 0_usize;
 
-    for turn in 0..total_api_calls {
+    while turn < total_api_calls + compensated_turns {
         log(&format!("Turn {}/{}", turn + 1, total_api_calls));
 
         let proto = build_request(
@@ -147,7 +150,7 @@ where
             options.ls_version.as_deref(),
         );
 
-        let response = match streaming(proto, timeout_ms, 2, options.ls_version.clone()).await {
+        let mut response = match streaming(proto, timeout_ms, 2, options.ls_version.clone()).await {
             Ok(response) => response,
             Err(err) => {
                 let base_meta = search_meta(&project_root, &repo_map, Some(err.code.clone()));
@@ -198,7 +201,41 @@ where
             }
         };
 
-        let (thinking, tool_calls) = match parse_response(&response) {
+        let mut parsed = parse_response(&response);
+        if matches!(&parsed, ParsedModelTurn::Text(text) if text.trim().is_empty()) {
+            log("Empty model response on turn; retrying once...");
+            let retry_proto = build_request(
+                &api_key,
+                &jwt,
+                &messages,
+                &tool_defs,
+                options.app_version.as_deref(),
+                options.ls_version.as_deref(),
+            );
+            response = match streaming(retry_proto, timeout_ms, 2, options.ls_version.clone()).await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    return SearchResult {
+                        files: Vec::new(),
+                        error: Some(format!("{}: {}", err.code, err.message)),
+                        meta: search_meta(&project_root, &repo_map, Some(err.code)),
+                        ..SearchResult::default()
+                    };
+                }
+            };
+            parsed = parse_response(&response);
+            if matches!(&parsed, ParsedModelTurn::Text(text) if text.trim().is_empty()) {
+                return SearchResult {
+                    files: Vec::new(),
+                    error: Some("Model returned empty response".to_string()),
+                    meta: search_meta(&project_root, &repo_map, None),
+                    ..SearchResult::default()
+                };
+            }
+        }
+
+        let (thinking, tool_calls) = match parsed {
             ParsedModelTurn::ToolCalls { thinking, calls } => (thinking, calls),
             ParsedModelTurn::Error(error) => {
                 return SearchResult {
@@ -226,7 +263,7 @@ where
                         .files,
                     rg_patterns: unique_patterns(executor.collected_rg_patterns()),
                     raw_response: Some(text),
-                    error: Some("Model returned no tool call or answer".to_string()),
+                    error: None,
                     meta: search_meta(&project_root, &repo_map, None),
                 };
             }
@@ -252,40 +289,54 @@ where
             .cloned()
             .or_else(|| tool_calls.into_iter().next());
         let Some(tool_call) = tool_call else {
+            turn += 1;
             continue;
         };
-        let (step, assistant_tool_name, assistant_tool_args, tool_ref_id) =
-            if tool_call.name == "restricted_exec" {
-                let step = InstantContextStep::from_calls(
-                    format!("restricted-exec-{}", turn + 1),
-                    restricted_exec_commands(&tool_call.args, options.max_commands),
-                );
-                (
-                    step,
-                    tool_call.name,
-                    tool_call.args.to_string(),
-                    tool_call.id,
-                )
-            } else {
-                let command = serde_json::json!({
-                    "type": tool_call.name,
-                    "arguments": tool_call.args,
-                });
-                let step = InstantContextStep::from_calls(
-                    format!("unsupported-tool-{}", turn + 1),
-                    vec![ExecutorToolCall {
-                        id: "command1".to_string(),
-                        name: "command1".to_string(),
-                        args: command,
-                    }],
-                );
-                (
-                    step,
-                    tool_call.name,
-                    tool_call.args.to_string(),
-                    tool_call.id,
-                )
-            };
+        let (step, assistant_tool_name, assistant_tool_args, tool_ref_id) = if tool_call.name
+            == "restricted_exec"
+        {
+            let has_valid_command =
+                has_valid_restricted_exec_command(&tool_call.args, options.max_commands);
+            let step = InstantContextStep::from_calls(
+                format!("restricted-exec-{}", turn + 1),
+                restricted_exec_commands(&tool_call.args, options.max_commands),
+            );
+            if !has_valid_command && compensated_turns < MAX_COMPENSATED_TURNS {
+                compensated_turns += 1;
+                log(&format!(
+                    "Turn compensation: no valid restricted_exec commands, extending search by 1 turn ({compensated_turns}/{MAX_COMPENSATED_TURNS})"
+                ));
+            } else if !has_valid_command {
+                log(&format!(
+                    "Turn compensation skipped: max compensations ({MAX_COMPENSATED_TURNS}) reached"
+                ));
+            }
+            (
+                step,
+                tool_call.name,
+                tool_call.args.to_string(),
+                tool_call.id,
+            )
+        } else {
+            let command = serde_json::json!({
+                "type": tool_call.name,
+                "arguments": tool_call.args,
+            });
+            let step = InstantContextStep::from_calls(
+                format!("unsupported-tool-{}", turn + 1),
+                vec![ExecutorToolCall {
+                    id: "command1".to_string(),
+                    name: "command1".to_string(),
+                    args: command,
+                }],
+            );
+            (
+                step,
+                tool_call.name,
+                tool_call.args.to_string(),
+                tool_call.id,
+            )
+        };
 
         log(&format!(
             "Executing {} restricted_exec commands",
@@ -318,11 +369,21 @@ where
             ref_call_id: Some(tool_ref_id),
         });
 
-        if turn >= options.max_turns.saturating_sub(1) && !force_answer_injected {
+        let effective_turns_used = (turn + 1)
+            .saturating_sub(compensated_turns)
+            .min(options.max_turns);
+        if effective_turns_used < options.max_turns {
+            messages.push(ChatMessage::simple(
+                1,
+                format_search_turn_status(effective_turns_used, options.max_turns),
+            ));
+        } else if !force_answer_injected {
             messages.push(ChatMessage::simple(1, FINAL_FORCE_ANSWER));
             force_answer_injected = true;
             log("Injected force-answer prompt");
         }
+
+        turn += 1;
     }
 
     SearchResult {
@@ -343,6 +404,13 @@ fn unique_patterns(patterns: Vec<String>) -> Vec<String> {
         }
     }
     unique
+}
+
+fn format_search_turn_status(used: usize, max_turns: usize) -> String {
+    format!(
+        "Search turns used: {used}. Search turns remaining: {}.",
+        max_turns.saturating_sub(used)
+    )
 }
 
 fn build_user_content(query: &str, repo_map: &RepoMap) -> String {
@@ -375,14 +443,10 @@ fn search_meta(
 
 fn restricted_exec_commands(args: &Value, max_commands: usize) -> Vec<ExecutorToolCall> {
     let Some(map) = args.as_object() else {
-        return vec![ExecutorToolCall {
-            id: "command1".to_string(),
-            name: "command1".to_string(),
-            args: serde_json::json!({"type": "", "error": "missing restricted_exec command object"}),
-        }];
+        return missing_restricted_exec_command();
     };
 
-    (1..=max_commands.clamp(1, 8))
+    let commands = (1..=max_commands.clamp(1, 8))
         .filter_map(|idx| {
             let key = format!("command{idx}");
             map.get(&key).map(|command| ExecutorToolCall {
@@ -391,7 +455,35 @@ fn restricted_exec_commands(args: &Value, max_commands: usize) -> Vec<ExecutorTo
                 args: command.clone(),
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if commands.is_empty() {
+        missing_restricted_exec_command()
+    } else {
+        commands
+    }
+}
+
+fn missing_restricted_exec_command() -> Vec<ExecutorToolCall> {
+    vec![ExecutorToolCall {
+        id: "command1".to_string(),
+        name: "command1".to_string(),
+        args: serde_json::json!({"type": "", "error": "missing restricted_exec command object"}),
+    }]
+}
+
+fn has_valid_restricted_exec_command(args: &Value, max_commands: usize) -> bool {
+    let Some(map) = args.as_object() else {
+        return false;
+    };
+
+    (1..=max_commands.clamp(1, 8)).any(|idx| {
+        let key = format!("command{idx}");
+        map.get(&key)
+            .and_then(Value::as_object)
+            .and_then(|command| command.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|command_type| !command_type.trim().is_empty())
+    })
 }
 
 fn format_restricted_exec_results(updates: &[InstantContextToolUpdate]) -> String {
@@ -664,6 +756,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_loop_reports_remaining_search_turns_after_valid_tool_round() {
+        let t1_frame = connect_frame_encode(
+            br#"{"output":"read context","tool_calls":[{"id":"q1","name":"restricted_exec","args":{"command1":{"type":"readfile","file":"/codebase/test.txt","start_line":1,"end_line":1}}}]}"#,
+            false,
+        );
+        let mut answer_encoder = ProtobufEncoder::new();
+        answer_encoder.write_string(
+            1,
+            r#"[TOOL_CALLS]answer[ARGS]{"answer": "<ANSWER><file path=\"/codebase/test.txt\"><range>1-1</range></file></ANSWER>"}"#,
+        );
+        let answer_frame = connect_frame_encode(&answer_encoder.to_bytes(), false);
+
+        let responses = Arc::new(Mutex::new(VecDeque::from([t1_frame, answer_frame])));
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("test.txt"), "line1").unwrap();
+
+        let mut options = SearchOptions::new("find test", tmp.path());
+        options.api_key = Some("sk-ws-01-key".to_string());
+        options.jwt = Some("mocked.jwt.token".to_string());
+        options.max_turns = 3;
+
+        let result = search_with_streaming(options, None, {
+            let responses = Arc::clone(&responses);
+            let requests = Arc::clone(&requests);
+            move |proto, _, _, _| {
+                let responses = Arc::clone(&responses);
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&proto).to_string());
+                    Ok(responses.lock().unwrap().pop_front().unwrap())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.error.is_none());
+        assert_eq!(result.files.len(), 1);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("Search turns used: 1. Search turns remaining: 2."));
+        assert!(!requests[1].contains(FINAL_FORCE_ANSWER));
+    }
+
+    #[tokio::test]
+    async fn search_loop_injects_force_answer_after_last_search_turn() {
+        let t1_frame = connect_frame_encode(
+            br#"{"output":"first read","tool_calls":[{"id":"q1","name":"restricted_exec","args":{"command1":{"type":"readfile","file":"/codebase/test.txt","start_line":1,"end_line":1}}}]}"#,
+            false,
+        );
+        let t2_frame = connect_frame_encode(
+            br#"{"output":"second read","tool_calls":[{"id":"q2","name":"restricted_exec","args":{"command1":{"type":"readfile","file":"/codebase/test.txt","start_line":2,"end_line":2}}}]}"#,
+            false,
+        );
+        let mut answer_encoder = ProtobufEncoder::new();
+        answer_encoder.write_string(
+            1,
+            r#"[TOOL_CALLS]answer[ARGS]{"answer": "<ANSWER><file path=\"/codebase/test.txt\"><range>1-2</range></file></ANSWER>"}"#,
+        );
+        let answer_frame = connect_frame_encode(&answer_encoder.to_bytes(), false);
+
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            t1_frame,
+            t2_frame,
+            answer_frame,
+        ])));
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("test.txt"), "line1\nline2").unwrap();
+
+        let mut options = SearchOptions::new("find test", tmp.path());
+        options.api_key = Some("sk-ws-01-key".to_string());
+        options.jwt = Some("mocked.jwt.token".to_string());
+        options.max_turns = 2;
+
+        let result = search_with_streaming(options, None, {
+            let responses = Arc::clone(&responses);
+            let requests = Arc::clone(&requests);
+            move |proto, _, _, _| {
+                let responses = Arc::clone(&responses);
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&proto).to_string());
+                    Ok(responses.lock().unwrap().pop_front().unwrap())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.error.is_none());
+        assert_eq!(result.files.len(), 1);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].contains("Search turns used: 1. Search turns remaining: 1."));
+        assert!(!requests[1].contains(FINAL_FORCE_ANSWER));
+        assert!(requests[2].contains(FINAL_FORCE_ANSWER));
+    }
+
+    #[tokio::test]
     async fn search_loop_keeps_range_map_internal_but_merges_final_result() {
         let t1_frame = connect_frame_encode(
             br#"{"output":"read context","tool_calls":[{"id":"q1","name":"restricted_exec","args":{"command1":{"type":"readfile","file":"/codebase/test.txt","start_line":1,"end_line":2}}}]}"#,
@@ -755,5 +954,169 @@ mod tests {
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].path, "test.txt");
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn search_loop_returns_raw_response_for_plain_text_without_answer() {
+        let mut t1_encoder = ProtobufEncoder::new();
+        t1_encoder.write_string(1, "I could not find a matching implementation.");
+        let t1_frame = connect_frame_encode(&t1_encoder.to_bytes(), false);
+
+        let responses = Arc::new(Mutex::new(VecDeque::from([t1_frame])));
+        let tmp = TempDir::new().unwrap();
+
+        let mut options = SearchOptions::new("find missing thing", tmp.path());
+        options.api_key = Some("sk-ws-01-key".to_string());
+        options.jwt = Some("mocked.jwt.token".to_string());
+        options.max_turns = 2;
+
+        let result = search_with_streaming(options, None, {
+            let responses = Arc::clone(&responses);
+            move |_, _, _, _| {
+                let responses = Arc::clone(&responses);
+                async move { Ok(responses.lock().unwrap().pop_front().unwrap()) }
+            }
+        })
+        .await;
+
+        assert!(result.error.is_none());
+        assert_eq!(
+            result.raw_response.as_deref(),
+            Some("I could not find a matching implementation.")
+        );
+        assert!(result.files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_loop_retries_empty_model_response_once() {
+        let mut t2_encoder = ProtobufEncoder::new();
+        t2_encoder.write_string(
+            1,
+            r#"<ANSWER><file path="/codebase/test.txt"><range>1-1</range></file></ANSWER>"#,
+        );
+        let t2_frame = connect_frame_encode(&t2_encoder.to_bytes(), false);
+
+        let responses = Arc::new(Mutex::new(VecDeque::from([Vec::new(), t2_frame])));
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("test.txt"), "line1").unwrap();
+
+        let mut options = SearchOptions::new("find test", tmp.path());
+        options.api_key = Some("sk-ws-01-key".to_string());
+        options.jwt = Some("mocked.jwt.token".to_string());
+        options.max_turns = 2;
+
+        let result = search_with_streaming(options, None, {
+            let responses = Arc::clone(&responses);
+            let call_count = Arc::clone(&call_count);
+            move |_, _, _, _| {
+                let responses = Arc::clone(&responses);
+                let call_count = Arc::clone(&call_count);
+                async move {
+                    call_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(responses.lock().unwrap().pop_front().unwrap())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.error.is_none());
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn search_loop_errors_after_empty_response_retry_exhausted() {
+        let responses = Arc::new(Mutex::new(VecDeque::from([Vec::new(), Vec::new()])));
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let tmp = TempDir::new().unwrap();
+
+        let mut options = SearchOptions::new("find test", tmp.path());
+        options.api_key = Some("sk-ws-01-key".to_string());
+        options.jwt = Some("mocked.jwt.token".to_string());
+        options.max_turns = 2;
+
+        let result = search_with_streaming(options, None, {
+            let responses = Arc::clone(&responses);
+            let call_count = Arc::clone(&call_count);
+            move |_, _, _, _| {
+                let responses = Arc::clone(&responses);
+                let call_count = Arc::clone(&call_count);
+                async move {
+                    call_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(responses.lock().unwrap().pop_front().unwrap())
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Model returned empty response")
+        );
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn search_loop_compensates_invalid_restricted_exec_once() {
+        let invalid_frame = connect_frame_encode(
+            br#"{"output":"bad command","tool_calls":[{"id":"q1","name":"restricted_exec","args":{}}]}"#,
+            false,
+        );
+        let valid_frame = connect_frame_encode(
+            br#"{"output":"read context","tool_calls":[{"id":"q2","name":"restricted_exec","args":{"command1":{"type":"readfile","file":"/codebase/test.txt","start_line":1,"end_line":1}}}]}"#,
+            false,
+        );
+        let mut answer_encoder = ProtobufEncoder::new();
+        answer_encoder.write_string(
+            1,
+            r#"[TOOL_CALLS]answer[ARGS]{"answer": "<ANSWER><file path=\"/codebase/test.txt\"><range>1-1</range></file></ANSWER>"}"#,
+        );
+        let answer_frame = connect_frame_encode(&answer_encoder.to_bytes(), false);
+
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            invalid_frame,
+            valid_frame,
+            answer_frame,
+        ])));
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("test.txt"), "line1").unwrap();
+
+        let mut options = SearchOptions::new("find test", tmp.path());
+        options.api_key = Some("sk-ws-01-key".to_string());
+        options.jwt = Some("mocked.jwt.token".to_string());
+        options.max_turns = 2;
+
+        let result = search_with_streaming(options, None, {
+            let responses = Arc::clone(&responses);
+            let requests = Arc::clone(&requests);
+            let call_count = Arc::clone(&call_count);
+            move |proto, _, _, _| {
+                let responses = Arc::clone(&responses);
+                let requests = Arc::clone(&requests);
+                let call_count = Arc::clone(&call_count);
+                async move {
+                    call_count.fetch_add(1, Ordering::SeqCst);
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&proto).to_string());
+                    Ok(responses.lock().unwrap().pop_front().unwrap())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.error.is_none());
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[1].contains("Search turns used: 0. Search turns remaining: 2."));
+        assert!(requests[2].contains("Search turns used: 1. Search turns remaining: 1."));
+        assert!(!requests[2].contains(FINAL_FORCE_ANSWER));
     }
 }

@@ -288,7 +288,10 @@ fn run_search(
     }
 
     if result.files.is_empty() {
-        println!("No relevant files found.");
+        println!(
+            "{}",
+            format_no_relevant_files(result.raw_response.as_deref())
+        );
         return 0;
     }
 
@@ -320,6 +323,13 @@ fn run_search(
     }
 
     0
+}
+
+fn format_no_relevant_files(raw_response: Option<&str>) -> String {
+    match raw_response {
+        Some(raw_response) => format!("No relevant files found.\n\nRaw response:\n{raw_response}"),
+        None => "No relevant files found.".to_string(),
+    }
 }
 
 fn read_path_filter_config() -> PathFilterConfig {
@@ -468,6 +478,14 @@ mod tests {
         assert_eq!(
             parse_env_u64_range_value("not-a-number", 1_000..=300_000),
             None
+        );
+    }
+
+    #[test]
+    fn no_relevant_files_output_includes_raw_response_when_present() {
+        assert_eq!(
+            format_no_relevant_files(Some("model text")),
+            "No relevant files found.\n\nRaw response:\nmodel text"
         );
     }
 }
