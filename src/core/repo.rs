@@ -2,6 +2,7 @@ use crate::executor::ToolExecutor;
 use crate::path_filter::PathFilterConfig;
 use regex::Regex;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Component, Path};
 
 use super::{FileEntry, MAX_TREE_BYTES, SearchResult};
@@ -22,7 +23,9 @@ pub fn get_repo_map(
     let executor =
         ToolExecutor::with_limits_and_filter(project_root, None, None, path_filter_config.clone());
     for depth in (1..=target_depth).rev() {
-        let tree = executor.tree("/codebase", Some(depth), None, false);
+        let Ok(tree) = build_scope_manifest(project_root, &executor, depth) else {
+            break;
+        };
         let size_bytes = tree.len();
         if size_bytes <= MAX_TREE_BYTES {
             return RepoMap {
@@ -34,21 +37,9 @@ pub fn get_repo_map(
         }
     }
 
-    match std::fs::read_dir(project_root) {
+    match visible_entries(project_root, &executor) {
         Ok(entries) => {
-            let mut names = entries
-                .flatten()
-                .filter(|entry| {
-                    let path = entry.path();
-                    executor.path_visible(&path, path.is_dir())
-                })
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .collect::<Vec<_>>();
-            names.sort();
-            let tree = std::iter::once("/codebase".to_string())
-                .chain(names.into_iter().map(|name| format!("├── {name}")))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let tree = capped_root_manifest(project_root, entries);
             RepoMap {
                 size_bytes: tree.len(),
                 tree,
@@ -66,6 +57,113 @@ pub fn get_repo_map(
             }
         }
     }
+}
+
+fn build_scope_manifest(
+    project_root: &Path,
+    executor: &ToolExecutor,
+    max_depth: usize,
+) -> std::io::Result<String> {
+    let mut lines = vec!["/codebase".to_string()];
+    let entries = visible_entries(project_root, executor)?;
+    append_scope_manifest_entries(&mut lines, project_root, executor, max_depth, 1, entries);
+    Ok(lines.join("\n"))
+}
+
+fn append_scope_manifest_entries(
+    lines: &mut Vec<String>,
+    project_root: &Path,
+    executor: &ToolExecutor,
+    max_depth: usize,
+    current_depth: usize,
+    entries: Vec<std::path::PathBuf>,
+) {
+    if current_depth > max_depth {
+        return;
+    }
+
+    for path in entries {
+        let is_dir = path.is_dir();
+        lines.push(manifest_line(project_root, &path, is_dir));
+        if is_dir && current_depth < max_depth {
+            let Ok(entries) = visible_entries(&path, executor) else {
+                continue;
+            };
+            append_scope_manifest_entries(
+                lines,
+                project_root,
+                executor,
+                max_depth,
+                current_depth + 1,
+                entries,
+            );
+        }
+    }
+}
+
+fn visible_entries(
+    dir_path: &Path,
+    executor: &ToolExecutor,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut paths = std::fs::read_dir(dir_path)?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| executor.path_visible(path, path.is_dir()))
+        .collect::<Vec<_>>();
+    paths.sort_by(|a, b| compare_scope_paths(a, b));
+    Ok(paths)
+}
+
+fn compare_scope_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
+    let a_is_file = !a.is_dir();
+    let b_is_file = !b.is_dir();
+    a_is_file.cmp(&b_is_file).then_with(|| {
+        let a_name = a
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        let b_name = b
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default()
+            .to_lowercase();
+        a_name.cmp(&b_name)
+    })
+}
+
+fn manifest_line(project_root: &Path, path: &Path, is_dir: bool) -> String {
+    let mut rel = path
+        .strip_prefix(project_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if is_dir {
+        rel.push('/');
+    }
+    rel
+}
+
+fn capped_root_manifest(project_root: &Path, entries: Vec<std::path::PathBuf>) -> String {
+    let suffix = "... (scope snapshot truncated) ...";
+    let mut tree = String::from("/codebase");
+    let mut truncated = false;
+
+    for path in entries {
+        let line = format!("\n{}", manifest_line(project_root, &path, path.is_dir()));
+        let suffix_len = if truncated { 0 } else { suffix.len() + 1 };
+        if tree.len() + line.len() + suffix_len > MAX_TREE_BYTES {
+            truncated = true;
+            break;
+        }
+        tree.push_str(&line);
+    }
+
+    if truncated {
+        tree.push('\n');
+        tree.push_str(suffix);
+    }
+    tree
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -132,22 +230,6 @@ impl RangeMap {
             files,
             ..SearchResult::default()
         }
-    }
-
-    pub(crate) fn to_xml(&self, max_results: usize) -> String {
-        let mut xml = String::from("<range_map>");
-        for (idx, (path, ranges)) in self.ranges.iter().enumerate() {
-            if idx >= max_results {
-                break;
-            }
-            xml.push_str(&format!("<file path=\"/codebase/{}\">", escape_xml(path)));
-            for (start, end) in merged_ranges(ranges) {
-                xml.push_str(&format!("<range>{start}-{end}</range>"));
-            }
-            xml.push_str("</file>");
-        }
-        xml.push_str("</range_map>");
-        xml
     }
 
     fn merge_rg_output(&mut self, output: &str) {
@@ -292,11 +374,4 @@ fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
         merged.push((start, end));
     }
     merged
-}
-
-fn escape_xml(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }

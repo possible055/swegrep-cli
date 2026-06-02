@@ -1,4 +1,5 @@
 use super::*;
+use crate::executor::InstantContextTiming;
 use crate::path_filter::PathFilterConfig;
 use crate::protobuf::{ProtobufEncoder, connect_frame_encode, gzip_compress};
 use base64::Engine;
@@ -52,8 +53,6 @@ fn build_system_prompt_uses_windsurf_context_subagent_contract() {
     assert!(prompt.contains("Think step-by-step"));
     assert!(prompt.contains("DO NOT EVER USE MORE THAN 6 commands"));
     assert!(prompt.contains("[TOOL_CALLS]restricted_exec[ARGS]"));
-    assert!(!prompt.contains("grep_search_v2"));
-    assert!(!prompt.contains("SearchQuery"));
     assert!(!prompt.contains("task_boundary"));
     assert!(!prompt.contains("notify_user"));
 }
@@ -90,8 +89,6 @@ fn tool_definitions_expose_only_restricted_exec_and_answer() {
     assert!(serialized.contains("\"tree\""));
     assert!(serialized.contains("\"ls\""));
     assert!(serialized.contains("\"glob\""));
-    assert!(!serialized.contains("grep_search_v2"));
-    assert!(!serialized.contains("SearchQuery"));
 }
 
 #[test]
@@ -241,7 +238,26 @@ fn parse_range_map_answer_merges_final_xml_and_limits_results() {
 }
 
 #[test]
-fn get_repo_map_uses_untruncated_tree() {
+fn build_user_content_includes_compact_scope_snapshot() {
+    let repo_map = RepoMap {
+        tree: "/codebase\nCargo.toml\nsrc/\nsrc/lib.rs".to_string(),
+        depth: 2,
+        size_bytes: 35,
+        fell_back: false,
+    };
+
+    let content = build_user_content("find parser", &repo_map);
+
+    assert!(content.contains("Workspace scope snapshot (depth 2):"));
+    assert!(content.contains("/codebase"));
+    assert!(content.contains("Cargo.toml"));
+    assert!(content.contains("src/"));
+    assert!(content.contains(r#"Please find the code context for the query: "(find parser)""#));
+    assert!(content.contains(r#"Constrain search to directory: "(/codebase)""#));
+}
+
+#[test]
+fn get_repo_map_uses_untruncated_manifest() {
     let tmp = TempDir::new().unwrap();
     for i in 0..60 {
         fs::write(tmp.path().join(format!("file_{i:03}.txt")), "").unwrap();
@@ -251,6 +267,88 @@ fn get_repo_map_uses_untruncated_tree() {
     assert!(!result.tree.contains("... (lines truncated) ..."));
     assert!(result.tree.contains("file_059.txt"));
     assert_eq!(result.size_bytes, result.tree.len());
+}
+
+#[test]
+fn get_repo_map_falls_back_to_compact_scope_snapshot() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join("src")).unwrap();
+    for i in 0..6_000 {
+        fs::write(
+            tmp.path().join(format!(
+                "very_long_file_name_for_scope_snapshot_padding_{i:05}.txt"
+            )),
+            "",
+        )
+        .unwrap();
+    }
+    fs::write(tmp.path().join("src").join("lib.rs"), "").unwrap();
+
+    let result = get_repo_map(tmp.path(), 4, &PathFilterConfig::default());
+
+    assert!(result.size_bytes <= MAX_TREE_BYTES);
+    assert!(result.fell_back);
+    assert!(result.tree.starts_with("/codebase"));
+    assert!(result.tree.lines().any(|line| line == "src/"));
+}
+
+#[test]
+fn get_repo_map_uses_manifest_path_format() {
+    let tmp = TempDir::new().unwrap();
+    fs::create_dir(tmp.path().join("src")).unwrap();
+    fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
+    fs::write(tmp.path().join("src").join("main.rs"), "").unwrap();
+
+    let result = get_repo_map(tmp.path(), 2, &PathFilterConfig::default());
+    let lines = result.tree.lines().collect::<Vec<_>>();
+
+    assert_eq!(lines[0], "/codebase");
+    assert!(lines.contains(&"Cargo.toml"));
+    assert!(lines.contains(&"src/"));
+    assert!(lines.contains(&"src/main.rs"));
+    assert!(!lines.contains(&"/codebase/src/main.rs"));
+}
+
+#[test]
+fn restricted_exec_results_hide_internal_status_timing_and_range_map() {
+    let updates = vec![
+        InstantContextToolUpdate {
+            step_id: "step-1".to_string(),
+            tool_call_id: "command1".to_string(),
+            tool_name: "command1".to_string(),
+            command: serde_json::json!({"type": "rg", "pattern": "main", "path": "/codebase"}),
+            status: ToolExecutionStatus::Completed,
+            output: "/codebase/src/main.rs:1:fn main() {}".to_string(),
+            timing: InstantContextTiming { duration_ms: 12 },
+        },
+        InstantContextToolUpdate {
+            step_id: "step-1".to_string(),
+            tool_call_id: "command2".to_string(),
+            tool_name: "command2".to_string(),
+            command: serde_json::json!({"type": "readfile", "file": "/codebase/src/lib.rs"}),
+            status: ToolExecutionStatus::TimedOut,
+            output: "Error: tool timed out".to_string(),
+            timing: InstantContextTiming { duration_ms: 1_000 },
+        },
+    ];
+
+    let output = format_restricted_exec_results(&updates);
+
+    assert!(output.contains("command1_result:\n/codebase/src/main.rs:1:fn main() {}"));
+    assert!(output.contains("command2_result:\nError: tool timed out"));
+    assert!(!output.contains("status="));
+    assert!(!output.contains("duration_ms="));
+    assert!(!output.contains("range_map:"));
+    assert!(!output.contains("<range_map>"));
+}
+
+#[test]
+fn timeout_env_value_is_seconds() {
+    assert_eq!(parse_timeout_seconds_ms("30"), Some(30_000));
+    assert_eq!(parse_timeout_seconds_ms("1.5"), Some(1_500));
+    assert_eq!(parse_timeout_seconds_ms("0"), None);
+    assert_eq!(parse_timeout_seconds_ms("-1"), None);
+    assert_eq!(parse_timeout_seconds_ms("not-a-number"), None);
 }
 
 #[test]
@@ -343,6 +441,62 @@ async fn search_loop_supports_restricted_exec_then_answer() {
     assert_eq!(result.files.len(), 1);
     assert_eq!(result.files[0].path, "test.txt");
     assert_eq!(result.files[0].ranges, vec![(1, 1)]);
+}
+
+#[tokio::test]
+async fn search_loop_keeps_range_map_internal_but_merges_final_result() {
+    let t1_frame = connect_frame_encode(
+        br#"{"output":"read context","tool_calls":[{"id":"q1","name":"restricted_exec","args":{"command1":{"type":"readfile","file":"/codebase/test.txt","start_line":1,"end_line":2}}}]}"#,
+        false,
+    );
+
+    let mut t2_encoder = ProtobufEncoder::new();
+    t2_encoder.write_string(
+        1,
+        r#"[TOOL_CALLS]answer[ARGS]{"answer": "<ANSWER></ANSWER>"}"#,
+    );
+    let t2_frame = connect_frame_encode(&t2_encoder.to_bytes(), false);
+
+    let responses = Arc::new(Mutex::new(VecDeque::from([t1_frame, t2_frame])));
+    let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("test.txt"), "line1\nline2\nline3").unwrap();
+
+    let mut options = SearchOptions::new("find test", tmp.path());
+    options.api_key = Some("sk-ws-01-key".to_string());
+    options.jwt = Some("mocked.jwt.token".to_string());
+    options.max_turns = 2;
+
+    let result = search_with_streaming(options, None, {
+        let responses = Arc::clone(&responses);
+        let requests = Arc::clone(&requests);
+        move |proto, _, _, _| {
+            let responses = Arc::clone(&responses);
+            let requests = Arc::clone(&requests);
+            async move {
+                requests
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&proto).to_string());
+                Ok(responses.lock().unwrap().pop_front().unwrap())
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(result.files.len(), 1);
+    assert_eq!(result.files[0].path, "test.txt");
+    assert_eq!(result.files[0].ranges, vec![(1, 2)]);
+
+    let requests = requests.lock().unwrap();
+    assert!(requests[0].contains("Workspace scope snapshot (depth "));
+    assert!(requests[0].contains("/codebase"));
+    assert!(requests[0].contains("test.txt"));
+    assert!(requests[1].contains("command1_result:"));
+    assert!(!requests[1].contains("status="));
+    assert!(!requests[1].contains("duration_ms="));
+    assert!(!requests[1].contains("range_map:"));
+    assert!(!requests[1].contains("<range_map>"));
 }
 
 #[tokio::test]

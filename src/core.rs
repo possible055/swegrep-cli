@@ -34,7 +34,7 @@ pub const AUTH_BASE: &str = "https://server.self-serve.windsurf.com/exa.auth_pb.
 pub const WS_APP: &str = "windsurf";
 pub const DEFAULT_WS_APP_VER: &str = "1.48.2";
 pub const DEFAULT_WS_LS_VER: &str = "1.9544.35";
-pub const MAX_TREE_BYTES: usize = 250 * 1024;
+pub const MAX_TREE_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Error)]
 #[error("{message}")]
@@ -195,7 +195,7 @@ where
 
     let mut timeout_ms = options.timeout_ms;
     if let Ok(raw_timeout) = env::var("TIMEOUT")
-        && let Ok(value) = raw_timeout.parse::<u64>()
+        && let Some(value) = parse_timeout_seconds_ms(&raw_timeout)
     {
         timeout_ms = value;
     }
@@ -232,10 +232,18 @@ where
     let system_prompt =
         build_system_prompt(options.max_turns, options.max_commands, options.max_results);
 
-    let user_content = format!(
-        r#"Please find the code context for the query: "({})". Constrain search to directory: "(/codebase)"."#,
-        options.query
-    );
+    let repo_map = get_repo_map(&project_root, options.tree_depth, &options.path_filter);
+    log(&format!(
+        "Repo map: scope snapshot depth {} ({:.1}KB){}",
+        repo_map.depth,
+        repo_map.size_bytes as f64 / 1024.0,
+        if repo_map.fell_back {
+            " [fell back]"
+        } else {
+            ""
+        }
+    ));
+    let user_content = build_user_content(&options.query, &repo_map);
 
     let mut messages = vec![
         ChatMessage::simple(5, system_prompt),
@@ -261,11 +269,7 @@ where
         let response = match streaming(proto, timeout_ms, 2, options.ls_version.clone()).await {
             Ok(response) => response,
             Err(err) => {
-                let base_meta = SearchMeta {
-                    project_root: Some(project_root.to_string_lossy().into_owned()),
-                    error_code: Some(err.code.clone()),
-                    ..SearchMeta::default()
-                };
+                let base_meta = search_meta(&project_root, &repo_map, Some(err.code.clone()));
 
                 if matches!(err.code.as_str(), "PAYLOAD_TOO_LARGE" | "TIMEOUT")
                     && messages.len() > 4
@@ -332,10 +336,7 @@ where
                         options.max_results,
                     );
                     result.rg_patterns = unique_patterns(executor.collected_rg_patterns());
-                    result.meta = SearchMeta {
-                        instant_context: Some(true),
-                        ..SearchMeta::default()
-                    };
+                    result.meta = search_meta(&project_root, &repo_map, None);
                     return result;
                 }
                 return SearchResult {
@@ -345,11 +346,7 @@ where
                     rg_patterns: unique_patterns(executor.collected_rg_patterns()),
                     raw_response: Some(text),
                     error: Some("Model returned no tool call or answer".to_string()),
-                    meta: SearchMeta {
-                        project_root: Some(project_root.to_string_lossy().into_owned()),
-                        instant_context: Some(true),
-                        ..SearchMeta::default()
-                    },
+                    meta: search_meta(&project_root, &repo_map, None),
                 };
             }
         };
@@ -364,10 +361,7 @@ where
             let mut result =
                 parse_range_map_answer(answer_xml, &project_root, &range_map, options.max_results);
             result.rg_patterns = unique_patterns(executor.collected_rg_patterns());
-            result.meta = SearchMeta {
-                instant_context: Some(true),
-                ..SearchMeta::default()
-            };
+            result.meta = search_meta(&project_root, &repo_map, None);
             return result;
         }
 
@@ -420,14 +414,11 @@ where
         let updates =
             executor.exec_restricted_exec_step(&step.id, &step.tool_calls, timeout_budget_ms);
         for update in &updates {
-            if matches!(
-                update.status,
-                ToolExecutionStatus::Completed | ToolExecutionStatus::TimedOut
-            ) {
+            if update.status == ToolExecutionStatus::Completed {
                 range_map.merge_tool_output(&update.command, &update.output);
             }
         }
-        let results = format_restricted_exec_results(&updates, &range_map, options.max_results);
+        let results = format_restricted_exec_results(&updates);
 
         messages.push(ChatMessage {
             role: 2,
@@ -457,11 +448,7 @@ where
         files: Vec::new(),
         rg_patterns: unique_patterns(executor.collected_rg_patterns()),
         error: Some("Max turns reached without getting an answer".to_string()),
-        meta: SearchMeta {
-            project_root: Some(project_root.to_string_lossy().into_owned()),
-            instant_context: Some(true),
-            ..SearchMeta::default()
-        },
+        meta: search_meta(&project_root, &repo_map, None),
         ..SearchResult::default()
     }
 }
@@ -475,6 +462,42 @@ fn unique_patterns(patterns: Vec<String>) -> Vec<String> {
         }
     }
     unique
+}
+
+fn parse_timeout_seconds_ms(raw: &str) -> Option<u64> {
+    let value = raw.parse::<f64>().ok()?;
+    if !value.is_finite() || value <= 0.0 {
+        return None;
+    }
+    Some((value * 1000.0).trunc() as u64)
+}
+
+fn build_user_content(query: &str, repo_map: &RepoMap) -> String {
+    format!(
+        r#"Workspace scope snapshot (depth {}):
+```text
+{}
+```
+
+Please find the code context for the query: "({})". Constrain search to directory: "(/codebase)"."#,
+        repo_map.depth, repo_map.tree, query
+    )
+}
+
+fn search_meta(
+    project_root: &std::path::Path,
+    repo_map: &RepoMap,
+    error_code: Option<String>,
+) -> SearchMeta {
+    SearchMeta {
+        tree_depth: Some(repo_map.depth),
+        tree_size_kb: Some((repo_map.size_bytes as f64 / 1024.0 * 10.0).round() / 10.0),
+        fell_back: Some(repo_map.fell_back),
+        project_root: Some(project_root.to_string_lossy().into_owned()),
+        error_code,
+        instant_context: Some(true),
+        ..SearchMeta::default()
+    }
 }
 
 fn restricted_exec_commands(args: &Value, max_commands: usize) -> Vec<ExecutorToolCall> {
@@ -498,28 +521,17 @@ fn restricted_exec_commands(args: &Value, max_commands: usize) -> Vec<ExecutorTo
         .collect()
 }
 
-fn format_restricted_exec_results(
-    updates: &[InstantContextToolUpdate],
-    range_map: &RangeMap,
-    max_results: usize,
-) -> String {
+fn format_restricted_exec_results(updates: &[InstantContextToolUpdate]) -> String {
     let mut out = String::new();
     for update in updates {
         if update.status == ToolExecutionStatus::Pending {
             continue;
         }
-        let status = match update.status {
-            ToolExecutionStatus::Completed => "COMPLETED",
-            ToolExecutionStatus::Error => "ERROR",
-            ToolExecutionStatus::TimedOut => "TIMED_OUT",
-            ToolExecutionStatus::Pending => unreachable!(),
-        };
         out.push_str(&format!(
-            "{}_result (status={}, duration_ms={}):\n{}\n",
-            update.tool_call_id, status, update.timing.duration_ms, update.output
+            "{}_result:\n{}\n",
+            update.tool_call_id, update.output
         ));
     }
-    out.push_str(&format!("range_map:\n{}\n", range_map.to_xml(max_results)));
     out
 }
 
@@ -554,7 +566,7 @@ pub async fn search_with_content(options: SearchOptions) -> String {
             match result.meta.error_code.as_deref() {
                 Some("PAYLOAD_TOO_LARGE" | "TIMEOUT") => {
                     err_msg.push_str(
-                        "\n[hint] Try: reduce tree_depth, add exclude.txt entries, or narrow project_path.",
+                        "\n[hint] Try: reduce scope snapshot depth, add exclude.txt entries, or narrow project_path.",
                     );
                 }
                 Some("AUTH_ERROR") => {

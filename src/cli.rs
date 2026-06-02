@@ -9,6 +9,8 @@ use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+const SCOPE_SNAPSHOT_TREE_DEPTH_ENV: &str = "SCOPE_SNAPSHOT_TREE_DEPTH";
+
 #[derive(Debug, Parser)]
 #[command(name = "swegrep-cli")]
 #[command(disable_help_subcommand = true)]
@@ -66,6 +68,7 @@ struct ExtractKeyArgs {
 pub fn run() -> i32 {
     load_skill_env();
     let default_turns = read_env_range("TURNS", 3, 3..=5);
+    let scope_snapshot_tree_depth = read_env_range(SCOPE_SNAPSHOT_TREE_DEPTH_ENV, 4, 0..=8);
 
     let cli = Cli::parse();
     if !command_exists("rg") {
@@ -75,7 +78,7 @@ pub fn run() -> i32 {
 
     match cli.command {
         Commands::ExtractKey(args) => run_extract_key(args),
-        Commands::Search(args) => run_search(args, default_turns),
+        Commands::Search(args) => run_search(args, default_turns, scope_snapshot_tree_depth),
     }
 }
 
@@ -112,10 +115,6 @@ pub fn load_skill_env() {
 
         if key == "API_KEY" {
             set_env_var("WINDSURF_API_KEY", &value);
-        } else if key == "TIMEOUT" {
-            if let Ok(seconds) = value.parse::<f64>() {
-                set_env_var("TIMEOUT", &(seconds * 1000.0).trunc().to_string());
-            }
         } else {
             set_env_var(key, &value);
         }
@@ -132,9 +131,14 @@ fn set_env_var(key: &str, value: &str) {
 fn read_env_range(name: &str, default: usize, range: std::ops::RangeInclusive<usize>) -> usize {
     env::var(name)
         .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| range.contains(value))
+        .and_then(|raw| parse_env_range_value(&raw, range))
         .unwrap_or(default)
+}
+
+fn parse_env_range_value(raw: &str, range: std::ops::RangeInclusive<usize>) -> Option<usize> {
+    raw.parse::<usize>()
+        .ok()
+        .filter(|value| range.contains(value))
 }
 
 fn parse_turns(value: &str) -> Result<usize, String> {
@@ -206,7 +210,7 @@ fn run_extract_key(args: ExtractKeyArgs) -> i32 {
     0
 }
 
-fn run_search(args: SearchArgs, default_turns: usize) -> i32 {
+fn run_search(args: SearchArgs, default_turns: usize, scope_snapshot_tree_depth: usize) -> i32 {
     let project_path = absolute_path(&args.path);
     if !project_path.is_dir() {
         eprintln!(
@@ -220,6 +224,7 @@ fn run_search(args: SearchArgs, default_turns: usize) -> i32 {
     let mut options = SearchOptions::new(args.query, project_path);
     options.api_key = args.api_key;
     options.max_turns = args.turns.unwrap_or(default_turns);
+    options.tree_depth = scope_snapshot_tree_depth;
     options.path_filter = path_filter;
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -377,4 +382,18 @@ fn command_exists(command: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_snapshot_tree_depth_env_accepts_expected_range() {
+        assert_eq!(parse_env_range_value("0", 0..=8), Some(0));
+        assert_eq!(parse_env_range_value("4", 0..=8), Some(4));
+        assert_eq!(parse_env_range_value("8", 0..=8), Some(8));
+        assert_eq!(parse_env_range_value("9", 0..=8), None);
+        assert_eq!(parse_env_range_value("not-a-number", 0..=8), None);
+    }
 }

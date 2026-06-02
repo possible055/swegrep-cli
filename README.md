@@ -11,7 +11,7 @@
 
 ## Requirements
 
-- Rust 1.96.0 or newer
+- Rust `1.96.0` or newer
 - `ripgrep` (`rg`) available in `PATH`
 - A logged-in Windsurf installation or a valid Windsurf API key
 
@@ -32,7 +32,7 @@ cargo test
 
 ## Usage
 
-### Search a Repository
+### Search Code
 
 ```bash
 swegrep-cli search "where is authentication handled" --path /path/to/project
@@ -83,15 +83,15 @@ Auto-discovery looks for `state.vscdb` in these locations:
 
 ## Path Filtering
 
-Path filtering is shared by local search tools.
+Local search tools share the same path filtering policy.
 
-By default, visibility is determined by:
+By default, visibility is determined in this order:
 
 1. `exclude.txt`
 2. `include.txt`
 3. Project-root `.gitignore`
 
-Additional behavior:
+Additional rules:
 
 - Patterns use gitignore-style syntax.
 - Empty lines and lines starting with `#` are ignored.
@@ -104,7 +104,7 @@ Global filter files:
 | `include.txt` | `~/.config/swegrep/include.txt` | `~/.swegrep/include.txt` |
 | `exclude.txt` | `~/.config/swegrep/exclude.txt` | `~/.swegrep/exclude.txt` |
 
-Disable this shared filtering policy with:
+Disable shared path filtering with:
 
 ```bash
 export SWEGREP_PATH_FILTER=0
@@ -112,12 +112,10 @@ export SWEGREP_PATH_FILTER=0
 
 ## Environment Variables
 
-At startup, the CLI also loads an optional `.env` file from the same config directory as `config.json`:
+At startup, the CLI optionally loads a `.env` file from the same config directory as `config.json`:
 
 - macOS / Linux: `~/.config/swegrep/.env`
 - Windows: `~/.swegrep/.env`
-
-The repo also includes [.env.example](/home/debian/projects/swegrep-cli/.env.example) as a tracked example. It is documentation only; the CLI does not read the repo-root `.env.example` or a repo-root `.env`.
 
 Supported variables:
 
@@ -133,15 +131,7 @@ Supported variables:
 | `TURNS` | `3` | Default maximum search rounds for `search` |
 | `TIMEOUT` | `30000` | Streaming timeout in milliseconds |
 
-Notes:
-
-- In the config `.env`, `API_KEY` is accepted as an alias for `WINDSURF_API_KEY`.
-- In the config `.env`, `TIMEOUT` is interpreted in seconds and converted to milliseconds before use.
-- These three truncation variables apply to the Windsurf Context subagent-compatible tool path used by `search`.
-- Legacy direct executor helpers keep their existing defaults: `readfile()` uses `50` lines and `250` chars per line unless explicitly overridden in code.
-
-## Caveats
+## Limitations
 
 - Search quality, availability, and rate limits depend on Windsurf account access and server behavior.
 - Some environments expose credentials as `devin-session-token$...`; pass the full string when using that format.
-- This project does not implement ACP sessions, permission UI, diff zones, MCP, terminal streaming, embeddings, or workspace indexing.
