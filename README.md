@@ -30,6 +30,20 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
+## Release Binaries
+
+Pushing a `v*` tag runs the release workflow and publishes GitHub Release
+assets for:
+
+- Linux x86_64
+- Linux ARM64
+- Windows x86_64
+
+```bash
+git tag v0.1.0
+git push origin main v0.1.0
+```
+
 ## Usage
 
 ### Search Code
