@@ -1,8 +1,6 @@
-use crate::executor::command_number;
 use crate::protobuf::{ProtobufEncoder, connect_frame_decode, extract_strings};
 use regex::Regex;
-use serde_json::{Map, Value, json};
-use std::collections::HashSet;
+use serde_json::{Value, json};
 use std::env;
 
 use super::WS_APP;
@@ -29,6 +27,23 @@ impl ChatMessage {
             ref_call_id: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ParsedToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) args: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ParsedModelTurn {
+    ToolCalls {
+        thinking: String,
+        calls: Vec<ParsedToolCall>,
+    },
+    Text(String),
+    Error(String),
 }
 
 fn build_metadata(
@@ -163,7 +178,53 @@ fn parse_tool_call(text: &str) -> Option<(String, String, Value)> {
     Some((thinking, name, args))
 }
 
-pub(crate) fn parse_response(data: &[u8]) -> (String, Option<(String, Value)>) {
+fn parse_structured_tool_call(value: &Value) -> Option<ParsedModelTurn> {
+    let tool_calls = value.get("tool_calls")?.as_array()?;
+    let calls = tool_calls
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, call)| {
+            let name = call
+                .get("name")
+                .or_else(|| {
+                    call.get("function")
+                        .and_then(|function| function.get("name"))
+                })?
+                .as_str()?
+                .to_string();
+            let args = call
+                .get("args")
+                .or_else(|| call.get("arguments"))
+                .or_else(|| {
+                    call.get("function")
+                        .and_then(|function| function.get("arguments"))
+                })?;
+            let args = if let Some(raw) = args.as_str() {
+                serde_json::from_str(raw).ok()?
+            } else {
+                args.clone()
+            };
+            let id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("tool-call-{}", idx + 1));
+            Some(ParsedToolCall { id, name, args })
+        })
+        .collect::<Vec<_>>();
+    if calls.is_empty() {
+        return None;
+    }
+    let thinking = value
+        .get("thinking")
+        .or_else(|| value.get("output"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some(ParsedModelTurn::ToolCalls { thinking, calls })
+}
+
+pub(crate) fn parse_response(data: &[u8]) -> ParsedModelTurn {
     let frames = connect_frame_decode(data);
     let mut all_text = String::new();
 
@@ -181,16 +242,31 @@ pub(crate) fn parse_response(data: &[u8]) -> (String, Option<(String, Value)>) {
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            return (format!("[Error] {code}: {msg}"), None);
+            return ParsedModelTurn::Error(format!("[Error] {code}: {msg}"));
+        }
+
+        if text_candidate.starts_with('{')
+            && let Ok(value) = serde_json::from_str::<Value>(&text_candidate)
+            && let Some(turn) = parse_structured_tool_call(&value)
+        {
+            return turn;
         }
 
         let raw_text = text_candidate.replace('\u{fffd}', "");
+        let extracted_strings = extract_strings(&frame_data);
         if raw_text.contains("[TOOL_CALLS]") {
-            all_text = raw_text;
+            all_text = if extracted_strings
+                .iter()
+                .any(|value| value.contains("[TOOL_CALLS]"))
+            {
+                extracted_strings.join("")
+            } else {
+                raw_text
+            };
             break;
         }
 
-        for value in extract_strings(&frame_data) {
+        for value in extracted_strings {
             if value.len() > 10 {
                 all_text.push_str(&value);
             }
@@ -198,22 +274,28 @@ pub(crate) fn parse_response(data: &[u8]) -> (String, Option<(String, Value)>) {
     }
 
     if let Some((thinking, name, args)) = parse_tool_call(&all_text) {
-        (thinking, Some((name, args)))
+        ParsedModelTurn::ToolCalls {
+            thinking,
+            calls: vec![ParsedToolCall {
+                id: "tool-call-1".to_string(),
+                name,
+                args,
+            }],
+        }
     } else {
-        (all_text, None)
+        ParsedModelTurn::Text(all_text)
     }
 }
 
 const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are an expert software engineer, responsible for providing context to another engineer to solve a code issue in the current codebase. The user will present you with a description of the issue, and it is your job to provide a series of file paths with associated line ranges that contain ALL the information relevant to understand and correctly address the issue.
-
 # IMPORTANT:
 - A relevant file does not mean only the files that must be modified to solve the task. It means any file that contains information relevant to planning and implementing the fix, such as the definitions of classes and functions that are relevant to the pieces of code that will have to be modified.
-- You should include enough context around the relevant lines to allow the engineer to understand the task correctly. You must include ENTIRE semantic blocks (functions, classes, definitions, etc). For example: If addressing the issue requires modifying a method within a class, then you should include the entire class definition, not just the lines around the method we want to modify.
+- You should include enough context around the relevant lines to allow the engineer to understand the task correctly. You must include ENTIRE semantic blocks (functions, classes, definitions, etc). For example:
+If addressing the issue requires modifying a method within a class, then you should include the entire class definition, not just the lines around the method we want to modify.
 - NEVER truncate these blocks unless they are very large (hundreds of lines or more, in which case providing only a relevant portion of the block is acceptable).
 - Your job is to essentially alleviate the job of the other engineer by giving them a clean starting context from which to start working. More precisely, you should minimize the number of files the engineer has to read to understand and solve the task correctly (while not providing irrelevant code snippets).
-
 # ENVIRONMENT
-- Working directory: /codebase. Make sure to run commands in this directory, not `.
+- Working directory: /codebase. Make sure to run commands in this directory, not `.`.
 - Tool access: use the restricted_exec tool ONLY
 - Allowed sub-commands (schema-enforced):
   - rg: Search for patterns in files using ripgrep
@@ -221,62 +303,61 @@ const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are an expert software engineer, res
     - Optional: include (array of globs), exclude (array of globs)
   - readfile: Read contents of a file with optional line range
     - Required: file (string)
-    - Optional: start_line (int), end_line (int) - 1-indexed, inclusive
+    - Optional: start_line (int), end_line (int)
+ 1-indexed, inclusive
   - tree: Display directory structure as a tree
     - Required: path (string)
     - Optional: levels (int)
-
 # THINKING RULES
 - Think step-by-step. Plan, reason, and reflect before each tool call.
 - Use tool calls liberally and purposefully to ground every conclusion in real code, not assumptions.
 - If a command fails, rethink and try something different; do not complain to the user.
-
 # FAST-SEARCH DEFAULTS (optimize rg/tree on large repos)
-- Start NARROW, then widen only if needed. Prefer searching likely code roots first (e.g., `src/`, `lib/`, `app/`, `packages/`, `services/`) instead of `/codebase`.
+- Start NARROW, then widen only if needed. Prefer searching likely code roots first (e.g., `src/`, `lib/`, `app/`, `packages/`, `services/`, `slime/`) instead of `/codebase`.
 - Prefer fixed-string search for literals: escape patterns or keep regex simple. Use smart case; avoid case-insensitive unless necessary.
 - Prefer file-type filters and globs (in include) over full-repo scans.
 - Default EXCLUDES for speed (apply via the exclude array): node_modules, .git, dist, build, coverage, .venv, venv, target, out, .cache, __pycache__, vendor, deps, third_party, logs, data, *.min.*
 - Skip huge files where possible; when opening files, prefer reading only relevant ranges with readfile.
 - Limit directory traversal with tree levels to quickly orient before deeper inspection.
-
 # SOME EXAMPLES OF WORKFLOWS
-- MAP - Use `tree` with small levels; `rg` on likely roots to grasp structure and hotspots.
-- ANCHOR - `rg` for problem keywords and anchor symbols; restrict by language globs via include.
-- TRACE - Follow imports with targeted `rg` in narrowed roots; open files with `readfile` scoped to entire semantic blocks.
-- VERIFY - Confirm each candidate path exists by reading or additional searches; drop false positives (tests, vendored, generated) unless they must change.
-
+- MAP
+ Use `tree` with small levels; `rg` on likely roots to grasp structure and hotspots.
+- ANCHOR
+ `rg` for problem keywords and anchor symbols; restrict by language globs via include.
+- TRACE
+ Follow imports with targeted `rg` in narrowed roots; open files with `readfile` scoped to entire semantic blocks.
+- VERIFY
+ Confirm each candidate path exists by reading or additional searches; drop false positives (tests, vendored, generated) unless they must change.
 # TOOL USE GUIDELINES
 - You must use a SINGLE restricted_exec call in your answer, that lets you execute at most {max_commands} commands in a single turn. Each command must be an object with a `type` field of `rg`, `readfile`, or `tree` and the appropriate fields for that type.
 - Example restricted_exec usage:
-[TOOL_CALLS]restricted_exec[ARGS]{{
-  "command1": {{
+[TOOL_CALLS]restricted_exec[ARGS]{
+  "command1": {
     "type": "rg",
     "pattern": "Controller",
     "path": "/codebase/slime",
     "include": ["**/*.py"],
     "exclude": ["**/node_modules/**", "**/.git/**", "**/dist/**", "**/build/**", "**/.venv/**", "**/__pycache__/**"]
-  }},
-  "command2": {{
+  },
+  "command2": {
     "type": "readfile",
     "file": "/codebase/slime/train.py",
     "start_line": 1,
     "end_line": 200
-  }},
-  "command3": {{
+  },
+  "command3": {
     "type": "tree",
     "path": "/codebase/slime/",
     "levels": 2
-  }}
-}}
+  }
+}
 - You have at most {max_turns} turns to interact with the environment by calling tools, so issuing multiple commands at once is necessary and encouraged to speed up your research.
 - Each command result may be truncated to 50 lines; prefer multiple targeted reads/searches to build complete context.
 - DO NOT EVER USE MORE THAN {max_commands} commands in a single turn, or you will be penalized.
-
 # ANSWER FORMAT (strict format, including tags)
 - You will output an XML structure with a root element "ANSWER" containing "file" elements. Each "file" element will have a "path" attribute and contain "range" elements.
 - You will output this as your final response.
 - The line ranges must be inclusive.
-
 Output example inside the "answer" tool argument:
 <ANSWER>
   <file path="/codebase/info_theory/formulas/entropy.py">
@@ -288,33 +369,25 @@ Output example inside the "answer" tool argument:
     <range>110-170</range>
   </file>
 </ANSWER>
-
 Remember: Prefer narrow, fixed-string, and type-filtered searches with aggressive excludes and size/depth limits. Widen scope only as needed. Use the restricted tools available to you, and output your answer in exactly the specified format.
-
-# NO RESULTS POLICY
-If after thorough searching you are confident that NO relevant files exist for the given query (e.g., the function/class/concept does not exist in the codebase), you MUST return an empty ANSWER:
-<ANSWER></ANSWER>
-Do NOT return irrelevant files (such as entry points or config files) just to provide some output. An empty answer is always better than a misleading one.
-
-# RESULT COUNT
-Aim to return at most {max_results} files in your answer. Focus on the most relevant files first. If fewer files are relevant, return fewer.
 "#;
 
 pub(crate) const FINAL_FORCE_ANSWER: &str =
     "You have no turns left. Now you MUST provide your final ANSWER, even if it's not complete.";
 
-fn build_command_schema(n: usize) -> Value {
-    json!({
+pub fn get_tool_definitions(max_commands: usize) -> String {
+    let max_commands = max_commands.clamp(1, 6);
+    let command_schema = json!({
         "type": "object",
-        "description": format!("Command {n} to execute. Must be one of: rg, readfile, or tree."),
+        "description": "Command to execute. Must be one of: rg, readfile, tree, ls, or glob.",
         "oneOf": [
             {
                 "properties": {
                     "type": {"type": "string", "const": "rg", "description": "Search for patterns in files using ripgrep."},
                     "pattern": {"type": "string", "description": "The regex pattern to search for."},
-                    "path": {"type": "string", "description": "The path to search in."},
-                    "include": {"type": "array", "items": {"type": "string"}, "description": "File patterns to include."},
-                    "exclude": {"type": "array", "items": {"type": "string"}, "description": "File patterns to exclude."}
+                    "path": {"type": "string", "description": "The path to search in (file or directory)."},
+                    "include": {"type": "array", "items": {"type": "string"}, "description": "File patterns to include in the search."},
+                    "exclude": {"type": "array", "items": {"type": "string"}, "description": "File patterns to exclude from the search."}
                 },
                 "required": ["type", "pattern", "path"]
             },
@@ -330,38 +403,36 @@ fn build_command_schema(n: usize) -> Value {
             {
                 "properties": {
                     "type": {"type": "string", "const": "tree", "description": "Display directory structure as a tree."},
-                    "path": {"type": "string", "description": "Path to the directory."},
-                    "levels": {"type": "integer", "description": "Number of directory levels."}
+                    "path": {"type": "string", "description": "Path to the directory to display."},
+                    "levels": {"type": "integer", "description": "Number of directory levels to show."}
                 },
                 "required": ["type", "path"]
             },
             {
                 "properties": {
                     "type": {"type": "string", "const": "ls", "description": "List files in a directory."},
-                    "path": {"type": "string", "description": "Path to the directory."},
-                    "long_format": {"type": "boolean"},
-                    "all": {"type": "boolean"}
+                    "path": {"type": "string", "description": "Path to the directory to list."},
+                    "long_format": {"type": "boolean", "description": "Use long format."},
+                    "all": {"type": "boolean", "description": "Show all files, including hidden files."}
                 },
                 "required": ["type", "path"]
             },
             {
                 "properties": {
                     "type": {"type": "string", "const": "glob", "description": "Find files matching a glob pattern."},
-                    "pattern": {"type": "string"},
-                    "path": {"type": "string"},
-                    "type_filter": {"type": "string", "enum": ["file", "directory", "all"]}
+                    "pattern": {"type": "string", "description": "Glob pattern to match."},
+                    "path": {"type": "string", "description": "Path to search in."},
+                    "type_filter": {"type": "string", "enum": ["file", "directory", "all"], "description": "Type of files to match."}
                 },
                 "required": ["type", "pattern", "path"]
             }
         ]
-    })
-}
-
-pub fn get_tool_definitions(max_commands: usize) -> String {
-    let mut props = Map::new();
-    for i in 1..=max_commands {
-        props.insert(format!("command{i}"), build_command_schema(i));
+    });
+    let mut properties = serde_json::Map::new();
+    for idx in 1..=max_commands {
+        properties.insert(format!("command{idx}"), command_schema.clone());
     }
+    let required = vec!["command1"];
 
     json!([
         {
@@ -369,7 +440,11 @@ pub fn get_tool_definitions(max_commands: usize) -> String {
             "function": {
                 "name": "restricted_exec",
                 "description": "Execute restricted commands (rg, readfile, tree, ls, glob) in parallel.",
-                "parameters": {"type": "object", "properties": props, "required": ["command1"]}
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required
+                }
             }
         },
         {
@@ -388,35 +463,11 @@ pub fn get_tool_definitions(max_commands: usize) -> String {
     .to_string()
 }
 
-pub fn limit_tool_args(tool_args: &Value, max_commands: usize) -> Value {
-    let Some(map) = tool_args.as_object() else {
-        return Value::Object(Map::new());
-    };
-    let mut command_keys = map
-        .keys()
-        .filter(|key| key.starts_with("command"))
-        .cloned()
-        .collect::<Vec<_>>();
-    command_keys.sort_by_key(|key| command_number(key));
-    let allowed = command_keys
-        .into_iter()
-        .take(max_commands)
-        .collect::<HashSet<_>>();
-
-    let mut limited = Map::new();
-    for (key, value) in map {
-        if !key.starts_with("command") || allowed.contains(key) {
-            limited.insert(key.clone(), value.clone());
-        }
-    }
-    Value::Object(limited)
-}
-
-pub fn build_system_prompt(max_turns: usize, max_commands: usize, max_results: usize) -> String {
+pub fn build_system_prompt(max_turns: usize, max_commands: usize, _max_results: usize) -> String {
+    let max_commands = max_commands.clamp(1, 6);
     SYSTEM_PROMPT_TEMPLATE
-        .replace("{max_turns}", &max_turns.to_string())
         .replace("{max_commands}", &max_commands.to_string())
-        .replace("{max_results}", &max_results.to_string())
+        .replace("{max_turns}", &max_turns.to_string())
 }
 
 pub(crate) fn trim_messages(messages: &mut Vec<ChatMessage>) -> bool {

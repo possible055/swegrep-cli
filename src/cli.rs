@@ -45,13 +45,6 @@ struct SearchArgs {
 
     #[arg(
         long,
-        value_parser = parse_depth,
-        help = "Directory tree depth for initial repo map (3-6). Default is from DEPTH or 4."
-    )]
-    depth: Option<usize>,
-
-    #[arg(
-        long,
         value_parser = parse_turns,
         help = "Maximum search rounds. Default is from TURNS or 3."
     )]
@@ -72,7 +65,6 @@ struct ExtractKeyArgs {
 
 pub fn run() -> i32 {
     load_skill_env();
-    let default_depth = read_env_range("DEPTH", 4, 3..=6);
     let default_turns = read_env_range("TURNS", 3, 3..=5);
 
     let cli = Cli::parse();
@@ -83,7 +75,7 @@ pub fn run() -> i32 {
 
     match cli.command {
         Commands::ExtractKey(args) => run_extract_key(args),
-        Commands::Search(args) => run_search(args, default_depth, default_turns),
+        Commands::Search(args) => run_search(args, default_turns),
     }
 }
 
@@ -143,10 +135,6 @@ fn read_env_range(name: &str, default: usize, range: std::ops::RangeInclusive<us
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| range.contains(value))
         .unwrap_or(default)
-}
-
-fn parse_depth(value: &str) -> Result<usize, String> {
-    parse_range(value, 3..=6, "depth")
 }
 
 fn parse_turns(value: &str) -> Result<usize, String> {
@@ -218,7 +206,7 @@ fn run_extract_key(args: ExtractKeyArgs) -> i32 {
     0
 }
 
-fn run_search(args: SearchArgs, default_depth: usize, default_turns: usize) -> i32 {
+fn run_search(args: SearchArgs, default_turns: usize) -> i32 {
     let project_path = absolute_path(&args.path);
     if !project_path.is_dir() {
         eprintln!(
@@ -232,7 +220,6 @@ fn run_search(args: SearchArgs, default_depth: usize, default_turns: usize) -> i
     let mut options = SearchOptions::new(args.query, project_path);
     options.api_key = args.api_key;
     options.max_turns = args.turns.unwrap_or(default_turns);
-    options.tree_depth = args.depth.unwrap_or(default_depth);
     options.path_filter = path_filter;
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()

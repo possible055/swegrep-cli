@@ -1,14 +1,18 @@
-use super::ToolExecutor;
 use super::helpers::{
     compare_dirs_first_case_insensitive, matches_any_pattern, matches_type, pattern_matches,
 };
+use super::{
+    InstantContextTiming, InstantContextToolCall, InstantContextToolUpdate, ToolExecutionStatus,
+    ToolExecutor,
+};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
 const RG_FILE_CHUNK_SIZE: usize = 200;
@@ -20,6 +24,17 @@ impl ToolExecutor {
         path: &str,
         include: Option<&[String]>,
         exclude: Option<&[String]>,
+    ) -> String {
+        self.rg_with_truncation(pattern, path, include, exclude, true)
+    }
+
+    fn rg_with_truncation(
+        &self,
+        pattern: &str,
+        path: &str,
+        include: Option<&[String]>,
+        exclude: Option<&[String]>,
+        legacy: bool,
     ) -> String {
         if pattern.is_empty() {
             return "Error: missing or invalid pattern".to_string();
@@ -38,10 +53,10 @@ impl ToolExecutor {
         }
 
         if !self.path_filter_enabled() {
-            return self.rg_native(pattern, &real_path, include, exclude);
+            return self.rg_native(pattern, &real_path, include, exclude, legacy);
         }
 
-        self.rg_filtered(pattern, &real_path, include, exclude)
+        self.rg_filtered(pattern, &real_path, include, exclude, legacy)
     }
 
     fn rg_filtered(
@@ -50,6 +65,7 @@ impl ToolExecutor {
         real_path: &Path,
         include: Option<&[String]>,
         exclude: Option<&[String]>,
+        legacy: bool,
     ) -> String {
         let files = self.rg_search_files(real_path, include, exclude);
         if files.is_empty() {
@@ -88,8 +104,11 @@ impl ToolExecutor {
                         continue;
                     }
                     if !output.stderr.is_empty() {
-                        return self
-                            .truncate(&self.remap(&String::from_utf8_lossy(&output.stderr)));
+                        return self.truncate_text(
+                            &self.remap(&String::from_utf8_lossy(&output.stderr)),
+                            legacy,
+                            false,
+                        );
                     }
                     return format!("Error: exit status {code}");
                 }
@@ -103,7 +122,7 @@ impl ToolExecutor {
         if all_stdout.is_empty() {
             "(no matches)".to_string()
         } else {
-            self.truncate(&self.remap(&all_stdout))
+            self.truncate_text(&self.remap(&all_stdout), legacy, false)
         }
     }
 
@@ -113,6 +132,7 @@ impl ToolExecutor {
         real_path: &Path,
         include: Option<&[String]>,
         exclude: Option<&[String]>,
+        legacy: bool,
     ) -> String {
         let mut args = vec![
             "--no-config".to_string(),
@@ -146,10 +166,14 @@ impl ToolExecutor {
                 }
                 if code == 0 {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    return self.truncate(&self.remap(&stdout));
+                    return self.truncate_text(&self.remap(&stdout), legacy, false);
                 }
                 if !output.stderr.is_empty() {
-                    return self.truncate(&self.remap(&String::from_utf8_lossy(&output.stderr)));
+                    return self.truncate_text(
+                        &self.remap(&String::from_utf8_lossy(&output.stderr)),
+                        legacy,
+                        false,
+                    );
                 }
                 format!("Error: exit status {code}")
             }
@@ -225,6 +249,16 @@ impl ToolExecutor {
         start_line: Option<usize>,
         end_line: Option<usize>,
     ) -> String {
+        self.readfile_with_mode(file, start_line, end_line, true)
+    }
+
+    fn readfile_with_mode(
+        &self,
+        file: &str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+        legacy: bool,
+    ) -> String {
         if file.is_empty() {
             return "Error: missing or invalid file path".to_string();
         }
@@ -253,7 +287,7 @@ impl ToolExecutor {
             .map(|(idx, line)| format!("{}:{line}", start + idx + 1))
             .collect::<Vec<_>>()
             .join("\n");
-        self.truncate(&out)
+        self.truncate_text(&out, legacy, !legacy)
     }
 
     pub fn tree(
@@ -262,6 +296,17 @@ impl ToolExecutor {
         levels: Option<usize>,
         exclude_paths: Option<&[String]>,
         truncate: bool,
+    ) -> String {
+        self.tree_with_mode(path, levels, exclude_paths, truncate, true)
+    }
+
+    fn tree_with_mode(
+        &self,
+        path: &str,
+        levels: Option<usize>,
+        exclude_paths: Option<&[String]>,
+        truncate: bool,
+        legacy: bool,
     ) -> String {
         if path.is_empty() {
             return "Error: missing or invalid path".to_string();
@@ -276,7 +321,7 @@ impl ToolExecutor {
         let stdout = lines.join("\n");
         let remapped = self.remap(&stdout);
         if truncate {
-            self.truncate(&remapped)
+            self.truncate_text(&remapped, legacy, false)
         } else {
             remapped
         }
@@ -351,6 +396,10 @@ impl ToolExecutor {
     }
 
     pub fn ls(&self, path: &str, long_format: bool, all_files: bool) -> String {
+        self.ls_with_mode(path, long_format, all_files, true)
+    }
+
+    fn ls_with_mode(&self, path: &str, long_format: bool, all_files: bool, legacy: bool) -> String {
         if path.is_empty() {
             return "Error: missing or invalid path".to_string();
         }
@@ -373,7 +422,7 @@ impl ToolExecutor {
         }
 
         if !long_format {
-            return self.truncate(&entries.join("\n"));
+            return self.truncate_text(&entries.join("\n"), legacy, false);
         }
 
         let mut lines = vec![format!("total {}", entries.len())];
@@ -385,7 +434,7 @@ impl ToolExecutor {
                 "{type_char}rwxr-xr-x  1 user  staff {size:>8} Jan 01 00:00 {name}"
             ));
         }
-        self.truncate(&self.remap(&lines.join("\n")))
+        self.truncate_text(&self.remap(&lines.join("\n")), legacy, false)
     }
 
     pub fn glob(&self, pattern: &str, path: &str, type_filter: &str) -> String {
@@ -465,15 +514,16 @@ impl ToolExecutor {
         };
         let command_type = cmd.get("type").and_then(Value::as_str).unwrap_or_default();
         match command_type {
-            "rg" => self.rg(
+            "rg" => self.rg_with_truncation(
                 cmd.get("pattern")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
                 cmd.get("path").and_then(Value::as_str).unwrap_or_default(),
                 string_array(cmd.get("include")).as_deref(),
                 string_array(cmd.get("exclude")).as_deref(),
+                false,
             ),
-            "readfile" => self.readfile(
+            "readfile" => self.readfile_with_mode(
                 cmd.get("file").and_then(Value::as_str).unwrap_or_default(),
                 cmd.get("start_line")
                     .and_then(Value::as_u64)
@@ -481,69 +531,128 @@ impl ToolExecutor {
                 cmd.get("end_line")
                     .and_then(Value::as_u64)
                     .map(|value| value as usize),
+                false,
             ),
-            "tree" => self.tree(
+            "tree" => self.tree_with_mode(
                 cmd.get("path").and_then(Value::as_str).unwrap_or_default(),
                 cmd.get("levels")
                     .and_then(Value::as_u64)
                     .map(|value| value as usize),
                 None,
                 true,
+                false,
             ),
-            "ls" => self.ls(
+            "ls" => self.ls_with_mode(
                 cmd.get("path").and_then(Value::as_str).unwrap_or_default(),
                 cmd.get("long_format")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 cmd.get("all").and_then(Value::as_bool).unwrap_or(false),
+                false,
             ),
-            "glob" => self.glob(
-                cmd.get("pattern")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                cmd.get("path").and_then(Value::as_str).unwrap_or_default(),
-                cmd.get("type_filter")
-                    .and_then(Value::as_str)
-                    .unwrap_or("all"),
+            "glob" => self.truncate_text(
+                &self.glob(
+                    cmd.get("pattern")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    cmd.get("path").and_then(Value::as_str).unwrap_or_default(),
+                    cmd.get("type_filter")
+                        .and_then(Value::as_str)
+                        .unwrap_or("file"),
+                ),
+                false,
+                false,
             ),
             _ => format!("Error: unknown command type '{command_type}'"),
         }
     }
 
-    pub fn exec_tool_call(&self, args: &Value) -> String {
-        let Some(args_map) = args.as_object() else {
-            return "Error: missing or invalid tool args".to_string();
-        };
-
-        let keys = command_keys(args);
-        if keys.is_empty() {
-            return String::new();
+    pub fn exec_restricted_exec_step(
+        &self,
+        step_id: &str,
+        tool_calls: &[InstantContextToolCall],
+        timeout_budget_ms: u128,
+    ) -> Vec<InstantContextToolUpdate> {
+        if tool_calls.is_empty() {
+            return Vec::new();
         }
 
-        let outputs = thread::scope(|scope| {
-            let handles = keys
-                .iter()
-                .map(|key| {
-                    let cmd = args_map.get(key).cloned().unwrap_or(Value::Null);
-                    scope.spawn(move || self.exec_command(&cmd))
-                })
-                .collect::<Vec<_>>();
+        let pending = tool_calls
+            .iter()
+            .map(|call| InstantContextToolUpdate {
+                step_id: step_id.to_string(),
+                tool_call_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                command: call.args.clone(),
+                status: ToolExecutionStatus::Pending,
+                output: String::new(),
+                timing: InstantContextTiming::default(),
+            })
+            .collect::<Vec<_>>();
 
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| "Error: command panicked".to_string())
-                })
-                .collect::<Vec<_>>()
-        });
+        let timeout = Duration::from_millis(timeout_budget_ms.min(u64::MAX as u128) as u64);
+        let receivers = tool_calls
+            .iter()
+            .map(|call| {
+                let executor = self.clone();
+                let call_name = call.name.clone();
+                let mut cmd = call.args.clone();
+                if let Some(map) = cmd.as_object_mut() {
+                    map.entry("type".to_string())
+                        .or_insert_with(|| Value::String(call_name));
+                }
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    let started = Instant::now();
+                    let output = executor.exec_command(&cmd);
+                    let duration_ms = started.elapsed().as_millis();
+                    let status = if output.trim_start().starts_with("Error:") {
+                        ToolExecutionStatus::Error
+                    } else {
+                        ToolExecutionStatus::Completed
+                    };
+                    let _ = tx.send((cmd, status, output, duration_ms));
+                });
+                rx
+            })
+            .collect::<Vec<_>>();
 
-        keys.iter()
+        let outputs = receivers
+            .into_iter()
+            .map(|rx| match rx.recv_timeout(timeout) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => (
+                    Value::Null,
+                    ToolExecutionStatus::TimedOut,
+                    "Error: tool timed out".to_string(),
+                    timeout_budget_ms,
+                ),
+                Err(mpsc::RecvTimeoutError::Disconnected) => (
+                    Value::Null,
+                    ToolExecutionStatus::Error,
+                    "Error: command panicked".to_string(),
+                    0,
+                ),
+            })
+            .collect::<Vec<_>>();
+
+        let completed = tool_calls
+            .iter()
             .zip(outputs)
-            .map(|(key, output)| format!("<{key}_result>\n{output}\n</{key}_result>"))
-            .collect::<Vec<_>>()
-            .join("")
+            .map(
+                |(call, (command, status, output, duration_ms))| InstantContextToolUpdate {
+                    step_id: step_id.to_string(),
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    command,
+                    status,
+                    output,
+                    timing: InstantContextTiming { duration_ms },
+                },
+            )
+            .collect::<Vec<_>>();
+
+        pending.into_iter().chain(completed).collect()
     }
 }
 
@@ -555,42 +664,4 @@ fn string_array(value: Option<&Value>) -> Option<Vec<String>> {
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>()
     })
-}
-
-pub fn command_number(key: &str) -> usize {
-    key.strip_prefix("command")
-        .and_then(|suffix| suffix.parse().ok())
-        .unwrap_or(9999)
-}
-
-pub fn command_keys(args: &Value) -> Vec<String> {
-    let Some(map) = args.as_object() else {
-        return Vec::new();
-    };
-    let mut keys = map
-        .keys()
-        .filter(|key| key.starts_with("command"))
-        .cloned()
-        .collect::<Vec<_>>();
-    keys.sort_by_key(|key| command_number(key));
-    keys
-}
-
-pub fn valid_command_count(args: &Value) -> usize {
-    let Some(map) = args.as_object() else {
-        return 0;
-    };
-    command_keys(args)
-        .into_iter()
-        .filter(|key| {
-            map.get(key)
-                .and_then(Value::as_object)
-                .and_then(|cmd| cmd.get("type"))
-                .is_some()
-        })
-        .count()
-}
-
-pub fn object_from_hashmap(map: HashMap<String, Value>) -> Value {
-    Value::Object(map.into_iter().collect())
 }

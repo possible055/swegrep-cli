@@ -1,20 +1,54 @@
 mod commands;
 mod helpers;
 
-pub use commands::{command_keys, command_number, object_from_hashmap, valid_command_count};
-
 use crate::path_filter::{PathFilter, PathFilterConfig};
 use helpers::{bounded_int, normalize_path, read_int_env};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolExecutionStatus {
+    Pending,
+    Completed,
+    Error,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstantContextTiming {
+    pub duration_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstantContextToolUpdate {
+    pub step_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub command: Value,
+    pub status: ToolExecutionStatus,
+    pub output: String,
+    pub timing: InstantContextTiming,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstantContextToolCall {
+    pub id: String,
+    pub name: String,
+    pub args: Value,
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolExecutor {
     root: PathBuf,
     collected_rg_patterns: Arc<Mutex<Vec<String>>>,
-    result_max_lines: usize,
-    line_max_chars: usize,
+    legacy_result_max_lines: usize,
+    legacy_line_max_chars: usize,
+    instant_context_result_max_lines: usize,
+    instant_context_readfile_max_lines: usize,
+    instant_context_line_max_chars: usize,
     path_filter: Arc<PathFilter>,
 }
 
@@ -51,15 +85,23 @@ impl ToolExecutor {
         Self {
             root,
             collected_rg_patterns: Arc::new(Mutex::new(Vec::new())),
-            result_max_lines: bounded_int(
+            legacy_result_max_lines: bounded_int(result_max_lines, 50, 1, 500),
+            legacy_line_max_chars: bounded_int(line_max_chars, 250, 20, 10_000),
+            instant_context_result_max_lines: bounded_int(
                 result_max_lines,
-                read_int_env("FC_RESULT_MAX_LINES", 50, 1, 500),
+                read_int_env("FC_RESULT_MAX_LINES", 80, 1, 500),
                 1,
                 500,
             ),
-            line_max_chars: bounded_int(
+            instant_context_readfile_max_lines: read_int_env(
+                "FC_READFILE_MAX_LINES",
+                200,
+                1,
+                10_000,
+            ),
+            instant_context_line_max_chars: bounded_int(
                 line_max_chars,
-                read_int_env("FC_LINE_MAX_CHARS", 250, 20, 10_000),
+                read_int_env("FC_LINE_MAX_CHARS", 300, 20, 10_000),
                 20,
                 10_000,
             ),
@@ -123,21 +165,55 @@ impl ToolExecutor {
         remapped
     }
 
-    fn truncate(&self, text: &str) -> String {
+    fn truncate_legacy(&self, text: &str) -> String {
+        self.truncate_with_limits(
+            text,
+            self.legacy_result_max_lines,
+            self.legacy_line_max_chars,
+        )
+    }
+
+    fn truncate_instant_context(&self, text: &str) -> String {
+        self.truncate_with_limits(
+            text,
+            self.instant_context_result_max_lines,
+            self.instant_context_line_max_chars,
+        )
+    }
+
+    fn truncate_instant_context_readfile(&self, text: &str) -> String {
+        self.truncate_with_limits(
+            text,
+            self.instant_context_readfile_max_lines,
+            self.instant_context_line_max_chars,
+        )
+    }
+
+    fn truncate_text(&self, text: &str, legacy: bool, readfile_tool: bool) -> String {
+        if legacy {
+            self.truncate_legacy(text)
+        } else if readfile_tool {
+            self.truncate_instant_context_readfile(text)
+        } else {
+            self.truncate_instant_context(text)
+        }
+    }
+
+    fn truncate_with_limits(&self, text: &str, max_lines: usize, line_max_chars: usize) -> String {
         let lines: Vec<&str> = text.split('\n').collect();
-        let limit = lines.len().min(self.result_max_lines);
+        let limit = lines.len().min(max_lines);
         let mut truncated = Vec::with_capacity(limit);
 
         for line in lines.iter().take(limit) {
-            if line.len() > self.line_max_chars {
-                truncated.push(line[..self.line_max_chars].to_string());
+            if line.len() > line_max_chars {
+                truncated.push(line[..line_max_chars].to_string());
             } else {
                 truncated.push((*line).to_string());
             }
         }
 
         let mut result = truncated.join("\n");
-        if lines.len() > self.result_max_lines {
+        if lines.len() > max_lines {
             result.push_str("\n... (lines truncated) ...");
         }
         result

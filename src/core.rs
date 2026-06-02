@@ -8,12 +8,18 @@ pub use auth::{
     load_cached_api_key, save_cached_api_key,
 };
 pub use http::decode_unary_response;
-pub use protocol::{build_system_prompt, get_tool_definitions, limit_tool_args};
+pub use protocol::{build_system_prompt, get_tool_definitions};
 pub use repo::{RepoMap, get_repo_map, parse_answer};
 
-use crate::executor::{ToolExecutor, command_keys, valid_command_count};
+use crate::executor::{
+    InstantContextToolCall as ExecutorToolCall, InstantContextToolUpdate, ToolExecutionStatus,
+    ToolExecutor,
+};
 use crate::path_filter::PathFilterConfig;
-use protocol::{ChatMessage, FINAL_FORCE_ANSWER, build_request, parse_response, trim_messages};
+use protocol::{
+    ChatMessage, FINAL_FORCE_ANSWER, ParsedModelTurn, build_request, parse_response, trim_messages,
+};
+use repo::{RangeMap, parse_range_map_answer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -21,7 +27,6 @@ use std::env;
 use std::future::Future;
 use std::path::PathBuf;
 use thiserror::Error;
-use uuid::Uuid;
 
 pub const API_BASE: &str =
     "https://server.self-serve.windsurf.com/exa.api_server_pb.ApiServerService";
@@ -64,6 +69,7 @@ pub struct SearchMeta {
     pub project_root: Option<String>,
     pub error_code: Option<String>,
     pub context_trimmed: Option<bool>,
+    pub instant_context: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -103,7 +109,7 @@ impl SearchOptions {
             app_version: None,
             ls_version: None,
             max_turns: 3,
-            max_commands: 8,
+            max_commands: 6,
             max_results: 10,
             tree_depth: 4,
             timeout_ms: 30_000,
@@ -111,6 +117,19 @@ impl SearchOptions {
             result_max_lines: None,
             line_max_chars: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct InstantContextStep {
+    id: String,
+    tool_calls: Vec<ExecutorToolCall>,
+}
+
+impl InstantContextStep {
+    fn from_calls(id: String, calls: Vec<ExecutorToolCall>) -> Self {
+        let tool_calls = calls;
+        Self { id, tool_calls }
     }
 }
 
@@ -208,25 +227,14 @@ where
     for warning in executor.path_filter_warnings() {
         log(&format!("Path filter warning: {warning}"));
     }
+    options.max_commands = options.max_commands.clamp(1, 6);
     let tool_defs = get_tool_definitions(options.max_commands);
     let system_prompt =
         build_system_prompt(options.max_turns, options.max_commands, options.max_results);
 
-    let repo_map = get_repo_map(&project_root, options.tree_depth, &options.path_filter);
-    let tree_size_kb = repo_map.size_bytes as f64 / 1024.0;
-    log(&format!(
-        "Repo map: tree -L {} ({tree_size_kb:.1}KB){}",
-        repo_map.depth,
-        if repo_map.fell_back {
-            " [fell back]"
-        } else {
-            ""
-        }
-    ));
-
     let user_content = format!(
-        "Problem Statement: {}\n\nRepo Map (tree -L {} /codebase):\n```text\n{}\n```",
-        options.query, repo_map.depth, repo_map.tree
+        r#"Please find the code context for the query: "({})". Constrain search to directory: "(/codebase)"."#,
+        options.query
     );
 
     let mut messages = vec![
@@ -235,20 +243,11 @@ where
     ];
 
     let total_api_calls = options.max_turns + 1;
-    let mut compensated_turns = 0_usize;
-    let max_compensations = 2_usize;
     let mut force_answer_injected = false;
+    let mut range_map = RangeMap::default();
 
-    for turn in 0..(total_api_calls + max_compensations) {
-        if turn >= total_api_calls + compensated_turns {
-            break;
-        }
-
-        log(&format!(
-            "Turn {}/{}",
-            turn + 1,
-            total_api_calls + compensated_turns
-        ));
+    for turn in 0..total_api_calls {
+        log(&format!("Turn {}/{}", turn + 1, total_api_calls));
 
         let proto = build_request(
             &api_key,
@@ -263,9 +262,6 @@ where
             Ok(response) => response,
             Err(err) => {
                 let base_meta = SearchMeta {
-                    tree_depth: Some(repo_map.depth),
-                    tree_size_kb: Some((tree_size_kb * 10.0).round() / 10.0),
-                    fell_back: Some(repo_map.fell_back),
                     project_root: Some(project_root.to_string_lossy().into_owned()),
                     error_code: Some(err.code.clone()),
                     ..SearchMeta::default()
@@ -317,79 +313,143 @@ where
             }
         };
 
-        let (thinking, tool_info) = parse_response(&response);
-        let Some((tool_name, tool_args)) = tool_info else {
-            if thinking.starts_with("[Error]") {
+        let (thinking, tool_calls) = match parse_response(&response) {
+            ParsedModelTurn::ToolCalls { thinking, calls } => (thinking, calls),
+            ParsedModelTurn::Error(error) => {
                 return SearchResult {
                     files: Vec::new(),
-                    error: Some(thinking),
+                    error: Some(error),
                     ..SearchResult::default()
                 };
             }
-            return SearchResult {
-                files: Vec::new(),
-                raw_response: Some(thinking),
-                ..SearchResult::default()
-            };
+            ParsedModelTurn::Text(text) => {
+                if text.contains("<ANSWER") {
+                    log("Received final answer");
+                    let mut result = parse_range_map_answer(
+                        &text,
+                        &project_root,
+                        &range_map,
+                        options.max_results,
+                    );
+                    result.rg_patterns = unique_patterns(executor.collected_rg_patterns());
+                    result.meta = SearchMeta {
+                        instant_context: Some(true),
+                        ..SearchMeta::default()
+                    };
+                    return result;
+                }
+                return SearchResult {
+                    files: range_map
+                        .to_result(&project_root, options.max_results)
+                        .files,
+                    rg_patterns: unique_patterns(executor.collected_rg_patterns()),
+                    raw_response: Some(text),
+                    error: Some("Model returned no tool call or answer".to_string()),
+                    meta: SearchMeta {
+                        project_root: Some(project_root.to_string_lossy().into_owned()),
+                        instant_context: Some(true),
+                        ..SearchMeta::default()
+                    },
+                };
+            }
         };
 
-        if tool_name == "answer" {
-            let answer_xml = tool_args
+        if let Some(answer_call) = tool_calls.iter().find(|call| call.name == "answer") {
+            let answer_xml = answer_call
+                .args
                 .get("answer")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             log("Received final answer");
-            let mut result = parse_answer(answer_xml, &project_root);
+            let mut result =
+                parse_range_map_answer(answer_xml, &project_root, &range_map, options.max_results);
             result.rg_patterns = unique_patterns(executor.collected_rg_patterns());
             result.meta = SearchMeta {
-                tree_depth: Some(repo_map.depth),
-                tree_size_kb: Some((tree_size_kb * 10.0).round() / 10.0),
-                fell_back: Some(repo_map.fell_back),
+                instant_context: Some(true),
                 ..SearchMeta::default()
             };
             return result;
         }
 
-        if tool_name == "restricted_exec" {
-            let call_id = Uuid::new_v4().to_string();
-            let limited_args = limit_tool_args(&tool_args, options.max_commands);
-            let args_json = limited_args.to_string();
-            let cmds = command_keys(&limited_args);
-            log(&format!("Executing {} local commands", cmds.len()));
+        let tool_call = tool_calls
+            .iter()
+            .find(|call| call.name == "restricted_exec")
+            .cloned()
+            .or_else(|| tool_calls.into_iter().next());
+        let Some(tool_call) = tool_call else {
+            continue;
+        };
+        let (step, assistant_tool_name, assistant_tool_args, tool_ref_id) =
+            if tool_call.name == "restricted_exec" {
+                let step = InstantContextStep::from_calls(
+                    format!("restricted-exec-{}", turn + 1),
+                    restricted_exec_commands(&tool_call.args, options.max_commands),
+                );
+                (
+                    step,
+                    tool_call.name,
+                    tool_call.args.to_string(),
+                    tool_call.id,
+                )
+            } else {
+                let command = serde_json::json!({
+                    "type": tool_call.name,
+                    "arguments": tool_call.args,
+                });
+                let step = InstantContextStep::from_calls(
+                    format!("unsupported-tool-{}", turn + 1),
+                    vec![ExecutorToolCall {
+                        id: "command1".to_string(),
+                        name: "command1".to_string(),
+                        args: command,
+                    }],
+                );
+                (
+                    step,
+                    tool_call.name,
+                    tool_call.args.to_string(),
+                    tool_call.id,
+                )
+            };
 
-            let results = executor.exec_tool_call(&limited_args);
-            if valid_command_count(&limited_args) == 0 && compensated_turns < max_compensations {
-                compensated_turns += 1;
-                log(&format!(
-                    "Turn compensation: no valid commands, extending search ({compensated_turns}/{max_compensations})"
-                ));
-            } else if valid_command_count(&limited_args) == 0 {
-                log("Turn compensation skipped: limit reached");
+        log(&format!(
+            "Executing {} restricted_exec commands",
+            step.tool_calls.len()
+        ));
+        let timeout_budget_ms = (timeout_ms as u128 / 2).max(1_000);
+        let updates =
+            executor.exec_restricted_exec_step(&step.id, &step.tool_calls, timeout_budget_ms);
+        for update in &updates {
+            if matches!(
+                update.status,
+                ToolExecutionStatus::Completed | ToolExecutionStatus::TimedOut
+            ) {
+                range_map.merge_tool_output(&update.command, &update.output);
             }
+        }
+        let results = format_restricted_exec_results(&updates, &range_map, options.max_results);
 
-            messages.push(ChatMessage {
-                role: 2,
-                content: thinking,
-                tool_call_id: Some(call_id.clone()),
-                tool_name: Some("restricted_exec".to_string()),
-                tool_args_json: Some(args_json),
-                ref_call_id: None,
-            });
-            messages.push(ChatMessage {
-                role: 4,
-                content: results,
-                tool_call_id: None,
-                tool_name: None,
-                tool_args_json: None,
-                ref_call_id: Some(call_id),
-            });
+        messages.push(ChatMessage {
+            role: 2,
+            content: thinking,
+            tool_call_id: Some(tool_ref_id.clone()),
+            tool_name: Some(assistant_tool_name),
+            tool_args_json: Some(assistant_tool_args),
+            ref_call_id: None,
+        });
+        messages.push(ChatMessage {
+            role: 4,
+            content: results,
+            tool_call_id: None,
+            tool_name: None,
+            tool_args_json: None,
+            ref_call_id: Some(tool_ref_id),
+        });
 
-            let effective_turn = turn.saturating_sub(compensated_turns);
-            if effective_turn >= options.max_turns.saturating_sub(1) && !force_answer_injected {
-                messages.push(ChatMessage::simple(1, FINAL_FORCE_ANSWER));
-                force_answer_injected = true;
-                log("Injected force-answer prompt");
-            }
+        if turn >= options.max_turns.saturating_sub(1) && !force_answer_injected {
+            messages.push(ChatMessage::simple(1, FINAL_FORCE_ANSWER));
+            force_answer_injected = true;
+            log("Injected force-answer prompt");
         }
     }
 
@@ -398,10 +458,8 @@ where
         rg_patterns: unique_patterns(executor.collected_rg_patterns()),
         error: Some("Max turns reached without getting an answer".to_string()),
         meta: SearchMeta {
-            tree_depth: Some(repo_map.depth),
-            tree_size_kb: Some((tree_size_kb * 10.0).round() / 10.0),
-            fell_back: Some(repo_map.fell_back),
             project_root: Some(project_root.to_string_lossy().into_owned()),
+            instant_context: Some(true),
             ..SearchMeta::default()
         },
         ..SearchResult::default()
@@ -417,6 +475,52 @@ fn unique_patterns(patterns: Vec<String>) -> Vec<String> {
         }
     }
     unique
+}
+
+fn restricted_exec_commands(args: &Value, max_commands: usize) -> Vec<ExecutorToolCall> {
+    let Some(map) = args.as_object() else {
+        return vec![ExecutorToolCall {
+            id: "command1".to_string(),
+            name: "command1".to_string(),
+            args: serde_json::json!({"type": "", "error": "missing restricted_exec command object"}),
+        }];
+    };
+
+    (1..=max_commands.clamp(1, 6))
+        .filter_map(|idx| {
+            let key = format!("command{idx}");
+            map.get(&key).map(|command| ExecutorToolCall {
+                id: key.clone(),
+                name: key,
+                args: command.clone(),
+            })
+        })
+        .collect()
+}
+
+fn format_restricted_exec_results(
+    updates: &[InstantContextToolUpdate],
+    range_map: &RangeMap,
+    max_results: usize,
+) -> String {
+    let mut out = String::new();
+    for update in updates {
+        if update.status == ToolExecutionStatus::Pending {
+            continue;
+        }
+        let status = match update.status {
+            ToolExecutionStatus::Completed => "COMPLETED",
+            ToolExecutionStatus::Error => "ERROR",
+            ToolExecutionStatus::TimedOut => "TIMED_OUT",
+            ToolExecutionStatus::Pending => unreachable!(),
+        };
+        out.push_str(&format!(
+            "{}_result (status={}, duration_ms={}):\n{}\n",
+            update.tool_call_id, status, update.timing.duration_ms, update.output
+        ));
+    }
+    out.push_str(&format!("range_map:\n{}\n", range_map.to_xml(max_results)));
+    out
 }
 
 pub async fn search_with_content(options: SearchOptions) -> String {
