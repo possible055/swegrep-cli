@@ -6,10 +6,12 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use walkdir::WalkDir;
+
+const RG_FILE_CHUNK_SIZE: usize = 200;
 
 impl ToolExecutor {
     pub fn rg(
@@ -35,13 +37,90 @@ impl ToolExecutor {
             return format!("Error: path does not exist: {path}");
         }
 
+        if !self.path_filter_enabled() {
+            return self.rg_native(pattern, &real_path, include, exclude);
+        }
+
+        self.rg_filtered(pattern, &real_path, include, exclude)
+    }
+
+    fn rg_filtered(
+        &self,
+        pattern: &str,
+        real_path: &Path,
+        include: Option<&[String]>,
+        exclude: Option<&[String]>,
+    ) -> String {
+        let files = self.rg_search_files(real_path, include, exclude);
+        if files.is_empty() {
+            return "(no matches)".to_string();
+        }
+
+        let mut all_stdout = String::new();
+        for chunk in files.chunks(RG_FILE_CHUNK_SIZE) {
+            let mut args = vec![
+                "--no-config".to_string(),
+                "--no-ignore".to_string(),
+                "--hidden".to_string(),
+                "--no-heading".to_string(),
+                "--with-filename".to_string(),
+                "-n".to_string(),
+                "--max-count".to_string(),
+                "50".to_string(),
+                "--".to_string(),
+                pattern.to_string(),
+            ];
+            args.extend(
+                chunk
+                    .iter()
+                    .map(|file| file.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            );
+
+            match Command::new("rg").args(args).output() {
+                Ok(output) => {
+                    let code = output.status.code().unwrap_or(-1);
+                    if code == 1 {
+                        continue;
+                    }
+                    if code == 0 {
+                        all_stdout.push_str(&String::from_utf8_lossy(&output.stdout));
+                        continue;
+                    }
+                    if !output.stderr.is_empty() {
+                        return self
+                            .truncate(&self.remap(&String::from_utf8_lossy(&output.stderr)));
+                    }
+                    return format!("Error: exit status {code}");
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return "Error: ripgrep ('rg') is not installed or not in PATH.".to_string();
+                }
+                Err(err) => return format!("Error: {err}"),
+            }
+        }
+
+        if all_stdout.is_empty() {
+            "(no matches)".to_string()
+        } else {
+            self.truncate(&self.remap(&all_stdout))
+        }
+    }
+
+    fn rg_native(
+        &self,
+        pattern: &str,
+        real_path: &Path,
+        include: Option<&[String]>,
+        exclude: Option<&[String]>,
+    ) -> String {
         let mut args = vec![
+            "--no-config".to_string(),
             "--no-heading".to_string(),
+            "--with-filename".to_string(),
             "-n".to_string(),
             "--max-count".to_string(),
             "50".to_string(),
-            pattern.to_string(),
-            real_path.to_string_lossy().into_owned(),
         ];
         if let Some(include) = include {
             for glob in include {
@@ -55,12 +134,11 @@ impl ToolExecutor {
                 args.push(format!("!{glob}"));
             }
         }
+        args.push("--".to_string());
+        args.push(pattern.to_string());
+        args.push(real_path.to_string_lossy().into_owned());
 
-        match Command::new("rg")
-            .args(args)
-            .env("RIPGREP_CONFIG_PATH", "")
-            .output()
-        {
+        match Command::new("rg").args(args).output() {
             Ok(output) => {
                 let code = output.status.code().unwrap_or(-1);
                 if code == 1 {
@@ -68,12 +146,7 @@ impl ToolExecutor {
                 }
                 if code == 0 {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stdout = if stdout.is_empty() {
-                        "(no matches)"
-                    } else {
-                        &stdout
-                    };
-                    return self.truncate(&self.remap(stdout));
+                    return self.truncate(&self.remap(&stdout));
                 }
                 if !output.stderr.is_empty() {
                     return self.truncate(&self.remap(&String::from_utf8_lossy(&output.stderr)));
@@ -85,6 +158,65 @@ impl ToolExecutor {
             }
             Err(err) => format!("Error: {err}"),
         }
+    }
+
+    fn rg_search_files(
+        &self,
+        real_path: &Path,
+        include: Option<&[String]>,
+        exclude: Option<&[String]>,
+    ) -> Vec<PathBuf> {
+        if real_path.is_file() {
+            return if self.is_visible_for_rg(real_path, include, exclude) {
+                vec![real_path.to_path_buf()]
+            } else {
+                Vec::new()
+            };
+        }
+
+        let mut files = WalkDir::new(real_path)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0 || self.is_visible_path(entry.path(), entry.file_type().is_dir())
+            })
+            .flatten()
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.path().to_path_buf())
+            .filter(|path| self.is_visible_for_rg(path, include, exclude))
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    fn is_visible_for_rg(
+        &self,
+        path: &Path,
+        include: Option<&[String]>,
+        exclude: Option<&[String]>,
+    ) -> bool {
+        if !self.is_visible_path(path, false) {
+            return false;
+        }
+
+        let rel = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+
+        if let Some(include) = include
+            && !include.is_empty()
+            && !matches_any_pattern(include, name, &rel)
+        {
+            return false;
+        }
+        if let Some(exclude) = exclude
+            && matches_any_pattern(exclude, name, &rel)
+        {
+            return false;
+        }
+        true
     }
 
     pub fn readfile(
@@ -176,7 +308,8 @@ impl ToolExecutor {
                 let Some(name) = item.file_name().and_then(OsStr::to_str) else {
                     return false;
                 };
-                if name.starts_with('.') {
+                let is_dir = item.is_dir();
+                if !self.is_visible_path(item, is_dir) {
                     return false;
                 }
                 if let Some(patterns) = exclude_patterns {
@@ -271,7 +404,14 @@ impl ToolExecutor {
         let mut matches = Vec::new();
         if pattern.contains("**") {
             let clean_pattern = pattern.strip_prefix("**/").unwrap_or(pattern);
-            for entry in WalkDir::new(&real_path).into_iter().flatten() {
+            for entry in WalkDir::new(&real_path)
+                .into_iter()
+                .filter_entry(|entry| {
+                    entry.depth() == 0
+                        || self.is_visible_path(entry.path(), entry.file_type().is_dir())
+                })
+                .flatten()
+            {
                 let item = entry.path();
                 if !matches_type(item, type_filter) {
                     continue;
@@ -293,6 +433,9 @@ impl ToolExecutor {
             for entry in entries.flatten() {
                 let item = entry.path();
                 if !matches_type(&item, type_filter) {
+                    continue;
+                }
+                if !self.is_visible_path(&item, item.is_dir()) {
                     continue;
                 }
                 let name = item.file_name().and_then(OsStr::to_str).unwrap_or_default();

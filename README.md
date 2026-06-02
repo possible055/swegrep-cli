@@ -57,6 +57,27 @@ swegrep-cli search "where is authentication handled" --path /path/to/project
 swegrep-cli search "query" --path . --api-key sk-ws-01-... --depth 4 --turns 3
 ```
 
+### Path Filtering
+
+Search uses the project root `.gitignore` by default when building the repo map and when running local `tree`, `rg`, and `glob` tools.
+
+You can override it with global swegrep filters:
+
+| File | Unix-like path | Windows path |
+| --- | --- | --- |
+| Include filter | `~/.config/swegrep/include.txt` | `~/.swegrep/include.txt` |
+| Exclude filter | `~/.config/swegrep/exclude.txt` | `~/.swegrep/exclude.txt` |
+
+Filter priority is:
+
+```text
+exclude.txt > include.txt > .gitignore
+```
+
+Patterns use gitignore-like syntax. Empty lines and `#` comments are ignored.
+
+`rg` uses the same filter by default and receives the final visible file list from swegrep. Set `SWEGREP_PATH_FILTER=0` in `.env` to disable this global filtering policy and let `rg` traverse natively.
+
 ### Environment Variables
 
 You can configure internal metadata or constraints through environment variables:
@@ -66,6 +87,7 @@ You can configure internal metadata or constraints through environment variables
 | `WINDSURF_API_KEY` | none | Windsurf API key / JWT / Devin session token |
 | `WS_APP_VER` | `1.48.2` | Windsurf app version metadata |
 | `WS_LS_VER` | `1.9544.35` | Windsurf language server version metadata |
+| `SWEGREP_PATH_FILTER` | `1` | Enable shared `.gitignore` / `include.txt` / `exclude.txt` filtering. Use `0`, `false`, `no`, or `off` to disable. |
 | `FC_RESULT_MAX_LINES` | `50` | Max lines per local tool result |
 | `FC_LINE_MAX_CHARS` | `250` | Max characters per local tool output line |
 | `DEPTH` | `4` | Directory tree depth for initial repo map |

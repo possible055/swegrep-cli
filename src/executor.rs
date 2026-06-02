@@ -3,6 +3,7 @@ mod helpers;
 
 pub use commands::{command_keys, command_number, object_from_hashmap, valid_command_count};
 
+use crate::path_filter::{PathFilter, PathFilterConfig};
 use helpers::{bounded_int, normalize_path, read_int_env};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ pub struct ToolExecutor {
     collected_rg_patterns: Arc<Mutex<Vec<String>>>,
     result_max_lines: usize,
     line_max_chars: usize,
+    path_filter: Arc<PathFilter>,
 }
 
 impl ToolExecutor {
@@ -26,10 +28,25 @@ impl ToolExecutor {
         result_max_lines: Option<usize>,
         line_max_chars: Option<usize>,
     ) -> Self {
+        Self::with_limits_and_filter(
+            project_root,
+            result_max_lines,
+            line_max_chars,
+            PathFilterConfig::default(),
+        )
+    }
+
+    pub fn with_limits_and_filter(
+        project_root: impl AsRef<Path>,
+        result_max_lines: Option<usize>,
+        line_max_chars: Option<usize>,
+        path_filter_config: PathFilterConfig,
+    ) -> Self {
         let root = project_root
             .as_ref()
             .canonicalize()
             .unwrap_or_else(|_| normalize_path(project_root.as_ref()));
+        let path_filter = Arc::new(PathFilter::new(&root, path_filter_config));
 
         Self {
             root,
@@ -46,6 +63,7 @@ impl ToolExecutor {
                 20,
                 10_000,
             ),
+            path_filter,
         }
     }
 
@@ -54,6 +72,14 @@ impl ToolExecutor {
             .lock()
             .map(|patterns| patterns.clone())
             .unwrap_or_default()
+    }
+
+    pub fn path_filter_warnings(&self) -> &[String] {
+        self.path_filter.warnings()
+    }
+
+    pub fn path_filter_enabled(&self) -> bool {
+        self.path_filter.is_enabled()
     }
 
     pub fn real(&self, virtual_path: &str) -> PathBuf {
@@ -115,6 +141,14 @@ impl ToolExecutor {
             result.push_str("\n... (lines truncated) ...");
         }
         result
+    }
+
+    fn is_visible_path(&self, path: &Path, is_dir: bool) -> bool {
+        self.path_filter.is_visible(path, is_dir)
+    }
+
+    pub(crate) fn path_visible(&self, path: &Path, is_dir: bool) -> bool {
+        self.is_visible_path(path, is_dir)
     }
 }
 

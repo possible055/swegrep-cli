@@ -1,6 +1,8 @@
 use super::*;
+use crate::path_filter::PathFilterConfig;
 use serde_json::{Value, json};
 use std::fs;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -107,6 +109,104 @@ fn glob_supports_recursive_patterns() {
     assert!(res.contains("/codebase/dir1/test1.py"));
     assert!(res.contains("/codebase/dir2/test2.py"));
     assert!(!res.contains("other.txt"));
+}
+
+#[test]
+fn path_filter_applies_to_tree_glob_and_rg() {
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join(".gitignore"), "ignored/\n*.log\n").unwrap();
+    fs::create_dir(tmp.path().join("ignored")).unwrap();
+    fs::write(tmp.path().join("ignored").join("keep.txt"), "needle").unwrap();
+    fs::write(tmp.path().join("ignored").join("skip.txt"), "needle").unwrap();
+    fs::create_dir(tmp.path().join("logs")).unwrap();
+    fs::write(tmp.path().join("logs").join("keep.log"), "needle").unwrap();
+    fs::write(tmp.path().join("logs").join("drop.log"), "needle").unwrap();
+    fs::create_dir(tmp.path().join(".cache")).unwrap();
+    fs::write(tmp.path().join(".cache").join("visible.txt"), "needle").unwrap();
+    fs::write(tmp.path().join("visible.txt"), "needle").unwrap();
+
+    let config = PathFilterConfig {
+        include_patterns: vec![
+            "ignored/keep.txt".to_string(),
+            "logs/keep.log".to_string(),
+            ".cache/visible.txt".to_string(),
+        ],
+        exclude_patterns: vec!["logs/drop.log".to_string()],
+        ..PathFilterConfig::default()
+    };
+    let executor = ToolExecutor::with_limits_and_filter(tmp.path(), None, None, config);
+
+    let tree = executor.tree("/codebase", Some(3), None, false);
+    assert!(tree.contains("visible.txt"));
+    assert!(tree.contains("keep.txt"));
+    assert!(tree.contains("keep.log"));
+    assert!(!tree.contains("skip.txt"));
+    assert!(!tree.contains("drop.log"));
+
+    let glob = executor.glob("**/*", "/codebase", "file");
+    assert!(glob.contains("/codebase/visible.txt"));
+    assert!(glob.contains("/codebase/ignored/keep.txt"));
+    assert!(glob.contains("/codebase/logs/keep.log"));
+    assert!(glob.contains("/codebase/.cache/visible.txt"));
+    assert!(!glob.contains("/codebase/ignored/skip.txt"));
+    assert!(!glob.contains("/codebase/logs/drop.log"));
+
+    if Command::new("rg").arg("--version").output().is_ok() {
+        let result = executor.rg("needle", "/codebase", None, None);
+        assert!(result.contains("/codebase/visible.txt"));
+        assert!(result.contains("/codebase/ignored/keep.txt"));
+        assert!(result.contains("/codebase/logs/keep.log"));
+        assert!(result.contains("/codebase/.cache/visible.txt"));
+        assert!(!result.contains("/codebase/ignored/skip.txt"));
+        assert!(!result.contains("/codebase/logs/drop.log"));
+    }
+}
+
+#[test]
+fn rg_includes_filename_for_single_file_results() {
+    if Command::new("rg").arg("--version").output().is_err() {
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("only.txt"), "needle").unwrap();
+    let executor = ToolExecutor::new(tmp.path());
+
+    let result = executor.rg("needle", "/codebase", None, None);
+
+    assert!(result.contains("/codebase/only.txt:1:needle"));
+}
+
+#[test]
+fn disabled_path_filter_uses_native_rg_traversal() {
+    if Command::new("rg").arg("--version").output().is_err() {
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("visible.txt"), "needle").unwrap();
+    let config = PathFilterConfig {
+        exclude_patterns: vec!["visible.txt".to_string()],
+        ..PathFilterConfig::default()
+    };
+    let disabled_config = PathFilterConfig {
+        enabled: false,
+        exclude_patterns: vec!["visible.txt".to_string()],
+        ..PathFilterConfig::default()
+    };
+
+    let filtered = ToolExecutor::with_limits_and_filter(tmp.path(), None, None, config);
+    let native = ToolExecutor::with_limits_and_filter(tmp.path(), None, None, disabled_config);
+
+    assert_eq!(
+        filtered.rg("needle", "/codebase", None, None),
+        "(no matches)"
+    );
+    assert!(
+        native
+            .rg("needle", "/codebase", None, None)
+            .contains("/codebase/visible.txt:1:needle")
+    );
 }
 
 #[test]

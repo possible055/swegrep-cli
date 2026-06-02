@@ -12,6 +12,7 @@ pub use protocol::{build_system_prompt, get_tool_definitions, limit_tool_args};
 pub use repo::{RepoMap, get_repo_map, parse_answer};
 
 use crate::executor::{ToolExecutor, command_keys, valid_command_count};
+use crate::path_filter::PathFilterConfig;
 use protocol::{ChatMessage, FINAL_FORCE_ANSWER, build_request, parse_response, trim_messages};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,7 +88,7 @@ pub struct SearchOptions {
     pub max_results: usize,
     pub tree_depth: usize,
     pub timeout_ms: u64,
-    pub exclude_paths: Vec<String>,
+    pub path_filter: PathFilterConfig,
     pub result_max_lines: Option<usize>,
     pub line_max_chars: Option<usize>,
 }
@@ -106,7 +107,7 @@ impl SearchOptions {
             max_results: 10,
             tree_depth: 4,
             timeout_ms: 30_000,
-            exclude_paths: Vec::new(),
+            path_filter: PathFilterConfig::default(),
             result_max_lines: None,
             line_max_chars: None,
         }
@@ -198,16 +199,20 @@ where
         },
     };
 
-    let executor = ToolExecutor::with_limits(
+    let executor = ToolExecutor::with_limits_and_filter(
         &project_root,
         options.result_max_lines,
         options.line_max_chars,
+        options.path_filter.clone(),
     );
+    for warning in executor.path_filter_warnings() {
+        log(&format!("Path filter warning: {warning}"));
+    }
     let tool_defs = get_tool_definitions(options.max_commands);
     let system_prompt =
         build_system_prompt(options.max_turns, options.max_commands, options.max_results);
 
-    let repo_map = get_repo_map(&project_root, options.tree_depth, &options.exclude_paths);
+    let repo_map = get_repo_map(&project_root, options.tree_depth, &options.path_filter);
     let tree_size_kb = repo_map.size_bytes as f64 / 1024.0;
     log(&format!(
         "Repo map: tree -L {} ({tree_size_kb:.1}KB){}",
@@ -445,7 +450,7 @@ pub async fn search_with_content(options: SearchOptions) -> String {
             match result.meta.error_code.as_deref() {
                 Some("PAYLOAD_TOO_LARGE" | "TIMEOUT") => {
                     err_msg.push_str(
-                        "\n[hint] Try: reduce tree_depth, add exclude_paths, or narrow project_path.",
+                        "\n[hint] Try: reduce tree_depth, add exclude.txt entries, or narrow project_path.",
                     );
                 }
                 Some("AUTH_ERROR") => {

@@ -1,9 +1,11 @@
 use crate::core::{SearchOptions, search};
 use crate::credentials::{self, extract_key, mask_api_key, save_cached_api_key};
+use crate::path_filter::PathFilterConfig;
 use clap::{Args, Parser, Subcommand};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -226,12 +228,12 @@ fn run_search(args: SearchArgs, default_depth: usize, default_turns: usize) -> i
         return 1;
     }
 
-    let exclude_patterns = read_exclude_patterns();
+    let path_filter = read_path_filter_config();
     let mut options = SearchOptions::new(args.query, project_path);
     options.api_key = args.api_key;
     options.max_turns = args.turns.unwrap_or(default_turns);
     options.tree_depth = args.depth.unwrap_or(default_depth);
-    options.exclude_paths = exclude_patterns;
+    options.path_filter = path_filter;
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -290,17 +292,56 @@ fn run_search(args: SearchArgs, default_depth: usize, default_turns: usize) -> i
     0
 }
 
-fn read_exclude_patterns() -> Vec<String> {
+fn read_path_filter_config() -> PathFilterConfig {
+    let path_filter_enabled = read_bool_env("SWEGREP_PATH_FILTER");
+    if path_filter_enabled == Some(false) {
+        return PathFilterConfig::disabled();
+    }
+
     let Some(config_dir) = credentials::get_config_path()
         .parent()
         .map(Path::to_path_buf)
     else {
-        return Vec::new();
+        return PathFilterConfig::default();
     };
-    let exclude_file = config_dir.join("exclude.txt");
-    let Ok(text) = fs::read_to_string(exclude_file) else {
-        return Vec::new();
+
+    let mut warnings = Vec::new();
+    if env::var("SWEGREP_PATH_FILTER").is_ok() && path_filter_enabled.is_none() {
+        warnings.push(
+            "Invalid SWEGREP_PATH_FILTER value; expected 1/0, true/false, yes/no, or on/off"
+                .to_string(),
+        );
+    }
+    let include_patterns = read_filter_patterns(&config_dir.join("include.txt"), &mut warnings);
+    let exclude_patterns = read_filter_patterns(&config_dir.join("exclude.txt"), &mut warnings);
+
+    PathFilterConfig {
+        enabled: true,
+        include_patterns,
+        exclude_patterns,
+        warnings,
+    }
+}
+
+fn read_bool_env(name: &str) -> Option<bool> {
+    let value = env::var(name).ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn read_filter_patterns(path: &Path, warnings: &mut Vec<String>) -> Vec<String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            warnings.push(format!("Could not read {}: {err}", path.display()));
+            return Vec::new();
+        }
     };
+
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))

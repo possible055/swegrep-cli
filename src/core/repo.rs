@@ -1,4 +1,5 @@
 use crate::executor::ToolExecutor;
+use crate::path_filter::PathFilterConfig;
 use regex::Regex;
 use std::path::{Component, Path};
 
@@ -12,10 +13,15 @@ pub struct RepoMap {
     pub fell_back: bool,
 }
 
-pub fn get_repo_map(project_root: &Path, target_depth: usize, exclude_paths: &[String]) -> RepoMap {
-    let executor = ToolExecutor::new(project_root);
+pub fn get_repo_map(
+    project_root: &Path,
+    target_depth: usize,
+    path_filter_config: &PathFilterConfig,
+) -> RepoMap {
+    let executor =
+        ToolExecutor::with_limits_and_filter(project_root, None, None, path_filter_config.clone());
     for depth in (1..=target_depth).rev() {
-        let tree = executor.tree("/codebase", Some(depth), Some(exclude_paths), false);
+        let tree = executor.tree("/codebase", Some(depth), None, false);
         let size_bytes = tree.len();
         if size_bytes <= MAX_TREE_BYTES {
             return RepoMap {
@@ -31,8 +37,11 @@ pub fn get_repo_map(project_root: &Path, target_depth: usize, exclude_paths: &[S
         Ok(entries) => {
             let mut names = entries
                 .flatten()
+                .filter(|entry| {
+                    let path = entry.path();
+                    executor.path_visible(&path, path.is_dir())
+                })
                 .filter_map(|entry| entry.file_name().into_string().ok())
-                .filter(|name| !exclude_paths.iter().any(|pat| glob_match(pat, name)))
                 .collect::<Vec<_>>();
             names.sort();
             let tree = std::iter::once("/codebase".to_string())
@@ -56,12 +65,6 @@ pub fn get_repo_map(project_root: &Path, target_depth: usize, exclude_paths: &[S
             }
         }
     }
-}
-
-fn glob_match(pattern: &str, text: &str) -> bool {
-    globset::Glob::new(pattern)
-        .map(|glob| glob.compile_matcher().is_match(text))
-        .unwrap_or(false)
 }
 
 pub fn parse_answer(xml_text: &str, project_root: &Path) -> SearchResult {

@@ -1,6 +1,6 @@
 # swegrep-cli Skill Configuration Guide
 
-This Rust CLI is designed to be packaged and executed as an agentic AI skill. Build it with `cargo build --release`, then expose `target/release/swegrep-cli` to the caller. To customize behavior when called by tools or systems, place environment and exclusion configuration files inside the native `swegrep` configuration directory.
+This Rust CLI is designed to be packaged and executed as an agentic AI skill. Build it with `cargo build --release`, then expose `target/release/swegrep-cli` to the caller. To customize behavior when called by tools or systems, place environment and path filtering configuration files inside the native `swegrep` configuration directory.
 
 ## Configuration Paths
 
@@ -36,15 +36,32 @@ TURNS=3
 
 ---
 
-## 2. Global Path Exclusions (`exclude.txt`)
+## 2. Global Path Filtering
 
-You can globally exclude certain file names or directory paths from the initial repository map traversal.
+The project root `.gitignore` is read by default. Global swegrep filters can override it for the repo map and local `tree`, `rg`, and `glob` tools.
 
-### Path
+Priority:
+
+```text
+exclude.txt > include.txt > .gitignore
+```
+
+### Include Path
+- Unix-like: `~/.config/swegrep/include.txt`
+- Windows: `~/.swegrep/include.txt`
+
+### Exclude Path
 - Unix-like: `~/.config/swegrep/exclude.txt`
 - Windows: `~/.swegrep/exclude.txt`
 
-### Example Content
+### Example `include.txt`
+```text
+# Re-include specific ignored files or directories
+target/generated-schema.json
+.config/visible.txt
+```
+
+### Example `exclude.txt`
 ```text
 # Exclude build directories and cache
 dist
@@ -56,4 +73,6 @@ node_modules
 .git
 ```
 
-Each non-empty line (that does not start with `#`) will be parsed as a glob pattern and filtered out during the directory tree generation phase.
+Each non-empty line that does not start with `#` is parsed as a gitignore-like pattern.
+
+`rg` uses this shared filter by default. Set `SWEGREP_PATH_FILTER=0` in `.env` to disable the global filtering policy and let `rg` traverse paths natively when comparing behavior or diagnosing filter issues.

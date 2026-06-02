@@ -1,4 +1,5 @@
 use super::*;
+use crate::path_filter::PathFilterConfig;
 use crate::protobuf::{ProtobufEncoder, connect_frame_encode, gzip_compress};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -90,7 +91,7 @@ fn get_repo_map_uses_untruncated_tree() {
         fs::write(tmp.path().join(format!("file_{i:03}.txt")), "").unwrap();
     }
 
-    let result = get_repo_map(tmp.path(), 1, &[]);
+    let result = get_repo_map(tmp.path(), 1, &PathFilterConfig::default());
     assert!(!result.tree.contains("... (lines truncated) ..."));
     assert!(result.tree.contains("file_059.txt"));
     assert_eq!(result.size_bytes, result.tree.len());
