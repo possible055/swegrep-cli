@@ -46,7 +46,14 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Install ripgrep
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
       - name: Test
+        if: runner.os == 'Linux'
         run: cargo test --locked
 
       - name: Build release binary
