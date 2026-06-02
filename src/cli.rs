@@ -10,6 +10,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const SCOPE_SNAPSHOT_TREE_DEPTH_ENV: &str = "SCOPE_SNAPSHOT_TREE_DEPTH";
+const FC_MAX_TURNS_ENV: &str = "FC_MAX_TURNS";
+const FC_MAX_COMMANDS_ENV: &str = "FC_MAX_COMMANDS";
+const FC_TIMEOUT_MS_ENV: &str = "FC_TIMEOUT_MS";
 
 #[derive(Debug, Parser)]
 #[command(name = "swegrep-cli")]
@@ -48,7 +51,7 @@ struct SearchArgs {
     #[arg(
         long,
         value_parser = parse_turns,
-        help = "Maximum search rounds. Default is from TURNS or 3."
+        help = "Maximum search rounds. Default is from FC_MAX_TURNS or 3."
     )]
     turns: Option<usize>,
 }
@@ -67,8 +70,10 @@ struct ExtractKeyArgs {
 
 pub fn run() -> i32 {
     load_skill_env();
-    let default_turns = read_env_range("TURNS", 3, 3..=5);
+    let default_turns = read_env_range(FC_MAX_TURNS_ENV, 3, 3..=5);
     let scope_snapshot_tree_depth = read_env_range(SCOPE_SNAPSHOT_TREE_DEPTH_ENV, 4, 0..=8);
+    let max_commands = read_env_range(FC_MAX_COMMANDS_ENV, 8, 1..=8);
+    let timeout_ms = read_timeout_ms_env();
 
     let cli = Cli::parse();
     if !command_exists("rg") {
@@ -78,7 +83,13 @@ pub fn run() -> i32 {
 
     match cli.command {
         Commands::ExtractKey(args) => run_extract_key(args),
-        Commands::Search(args) => run_search(args, default_turns, scope_snapshot_tree_depth),
+        Commands::Search(args) => run_search(
+            args,
+            default_turns,
+            scope_snapshot_tree_depth,
+            max_commands,
+            timeout_ms,
+        ),
     }
 }
 
@@ -129,14 +140,33 @@ fn set_env_var(key: &str, value: &str) {
 }
 
 fn read_env_range(name: &str, default: usize, range: std::ops::RangeInclusive<usize>) -> usize {
+    read_env_range_value(name, range).unwrap_or(default)
+}
+
+fn read_env_range_value(name: &str, range: std::ops::RangeInclusive<usize>) -> Option<usize> {
     env::var(name)
         .ok()
         .and_then(|raw| parse_env_range_value(&raw, range))
-        .unwrap_or(default)
 }
 
 fn parse_env_range_value(raw: &str, range: std::ops::RangeInclusive<usize>) -> Option<usize> {
     raw.parse::<usize>()
+        .ok()
+        .filter(|value| range.contains(value))
+}
+
+fn read_timeout_ms_env() -> u64 {
+    read_env_u64_range(FC_TIMEOUT_MS_ENV, 1_000..=300_000).unwrap_or(30_000)
+}
+
+fn read_env_u64_range(name: &str, range: std::ops::RangeInclusive<u64>) -> Option<u64> {
+    env::var(name)
+        .ok()
+        .and_then(|raw| parse_env_u64_range_value(&raw, range))
+}
+
+fn parse_env_u64_range_value(raw: &str, range: std::ops::RangeInclusive<u64>) -> Option<u64> {
+    raw.parse::<u64>()
         .ok()
         .filter(|value| range.contains(value))
 }
@@ -210,7 +240,13 @@ fn run_extract_key(args: ExtractKeyArgs) -> i32 {
     0
 }
 
-fn run_search(args: SearchArgs, default_turns: usize, scope_snapshot_tree_depth: usize) -> i32 {
+fn run_search(
+    args: SearchArgs,
+    default_turns: usize,
+    scope_snapshot_tree_depth: usize,
+    max_commands: usize,
+    timeout_ms: u64,
+) -> i32 {
     let project_path = absolute_path(&args.path);
     if !project_path.is_dir() {
         eprintln!(
@@ -224,6 +260,8 @@ fn run_search(args: SearchArgs, default_turns: usize, scope_snapshot_tree_depth:
     let mut options = SearchOptions::new(args.query, project_path);
     options.api_key = args.api_key;
     options.max_turns = args.turns.unwrap_or(default_turns);
+    options.max_commands = max_commands;
+    options.timeout_ms = timeout_ms;
     options.tree_depth = scope_snapshot_tree_depth;
     options.path_filter = path_filter;
 
@@ -395,5 +433,41 @@ mod tests {
         assert_eq!(parse_env_range_value("8", 0..=8), Some(8));
         assert_eq!(parse_env_range_value("9", 0..=8), None);
         assert_eq!(parse_env_range_value("not-a-number", 0..=8), None);
+    }
+
+    #[test]
+    fn fc_max_commands_env_accepts_expected_range() {
+        assert_eq!(parse_env_range_value("1", 1..=8), Some(1));
+        assert_eq!(parse_env_range_value("8", 1..=8), Some(8));
+        assert_eq!(parse_env_range_value("0", 1..=8), None);
+        assert_eq!(parse_env_range_value("9", 1..=8), None);
+        assert_eq!(parse_env_range_value("not-a-number", 1..=8), None);
+    }
+
+    #[test]
+    fn fc_max_turns_env_accepts_expected_range() {
+        assert_eq!(parse_env_range_value("3", 3..=5), Some(3));
+        assert_eq!(parse_env_range_value("5", 3..=5), Some(5));
+        assert_eq!(parse_env_range_value("2", 3..=5), None);
+        assert_eq!(parse_env_range_value("6", 3..=5), None);
+        assert_eq!(parse_env_range_value("not-a-number", 3..=5), None);
+    }
+
+    #[test]
+    fn fc_timeout_ms_env_accepts_expected_range() {
+        assert_eq!(
+            parse_env_u64_range_value("1000", 1_000..=300_000),
+            Some(1_000)
+        );
+        assert_eq!(
+            parse_env_u64_range_value("300000", 1_000..=300_000),
+            Some(300_000)
+        );
+        assert_eq!(parse_env_u64_range_value("999", 1_000..=300_000), None);
+        assert_eq!(parse_env_u64_range_value("300001", 1_000..=300_000), None);
+        assert_eq!(
+            parse_env_u64_range_value("not-a-number", 1_000..=300_000),
+            None
+        );
     }
 }

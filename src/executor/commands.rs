@@ -3,7 +3,7 @@ use super::helpers::{
 };
 use super::{
     InstantContextTiming, InstantContextToolCall, InstantContextToolUpdate, ToolExecutionStatus,
-    ToolExecutor,
+    ToolExecutor, TruncationProfile,
 };
 use serde_json::Value;
 use std::ffi::OsStr;
@@ -18,23 +18,12 @@ use walkdir::WalkDir;
 const RG_FILE_CHUNK_SIZE: usize = 200;
 
 impl ToolExecutor {
-    pub fn rg(
+    fn execute_rg(
         &self,
         pattern: &str,
         path: &str,
         include: Option<&[String]>,
         exclude: Option<&[String]>,
-    ) -> String {
-        self.rg_with_truncation(pattern, path, include, exclude, true)
-    }
-
-    fn rg_with_truncation(
-        &self,
-        pattern: &str,
-        path: &str,
-        include: Option<&[String]>,
-        exclude: Option<&[String]>,
-        legacy: bool,
     ) -> String {
         if pattern.is_empty() {
             return "Error: missing or invalid pattern".to_string();
@@ -53,10 +42,10 @@ impl ToolExecutor {
         }
 
         if !self.path_filter_enabled() {
-            return self.rg_native(pattern, &real_path, include, exclude, legacy);
+            return self.rg_native(pattern, &real_path, include, exclude);
         }
 
-        self.rg_filtered(pattern, &real_path, include, exclude, legacy)
+        self.rg_filtered(pattern, &real_path, include, exclude)
     }
 
     fn rg_filtered(
@@ -65,7 +54,6 @@ impl ToolExecutor {
         real_path: &Path,
         include: Option<&[String]>,
         exclude: Option<&[String]>,
-        legacy: bool,
     ) -> String {
         let files = self.rg_search_files(real_path, include, exclude);
         if files.is_empty() {
@@ -106,8 +94,7 @@ impl ToolExecutor {
                     if !output.stderr.is_empty() {
                         return self.truncate_text(
                             &self.remap(&String::from_utf8_lossy(&output.stderr)),
-                            legacy,
-                            false,
+                            TruncationProfile::General,
                         );
                     }
                     return format!("Error: exit status {code}");
@@ -122,7 +109,7 @@ impl ToolExecutor {
         if all_stdout.is_empty() {
             "(no matches)".to_string()
         } else {
-            self.truncate_text(&self.remap(&all_stdout), legacy, false)
+            self.truncate_text(&self.remap(&all_stdout), TruncationProfile::General)
         }
     }
 
@@ -132,7 +119,6 @@ impl ToolExecutor {
         real_path: &Path,
         include: Option<&[String]>,
         exclude: Option<&[String]>,
-        legacy: bool,
     ) -> String {
         let mut args = vec![
             "--no-config".to_string(),
@@ -166,13 +152,12 @@ impl ToolExecutor {
                 }
                 if code == 0 {
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    return self.truncate_text(&self.remap(&stdout), legacy, false);
+                    return self.truncate_text(&self.remap(&stdout), TruncationProfile::General);
                 }
                 if !output.stderr.is_empty() {
                     return self.truncate_text(
                         &self.remap(&String::from_utf8_lossy(&output.stderr)),
-                        legacy,
-                        false,
+                        TruncationProfile::General,
                     );
                 }
                 format!("Error: exit status {code}")
@@ -243,21 +228,11 @@ impl ToolExecutor {
         true
     }
 
-    pub fn readfile(
+    fn execute_readfile(
         &self,
         file: &str,
         start_line: Option<usize>,
         end_line: Option<usize>,
-    ) -> String {
-        self.readfile_with_mode(file, start_line, end_line, true)
-    }
-
-    fn readfile_with_mode(
-        &self,
-        file: &str,
-        start_line: Option<usize>,
-        end_line: Option<usize>,
-        legacy: bool,
     ) -> String {
         if file.is_empty() {
             return "Error: missing or invalid file path".to_string();
@@ -287,27 +262,10 @@ impl ToolExecutor {
             .map(|(idx, line)| format!("{}:{line}", start + idx + 1))
             .collect::<Vec<_>>()
             .join("\n");
-        self.truncate_text(&out, legacy, !legacy)
+        self.truncate_text(&out, TruncationProfile::ReadfileExpanded)
     }
 
-    pub fn tree(
-        &self,
-        path: &str,
-        levels: Option<usize>,
-        exclude_paths: Option<&[String]>,
-        truncate: bool,
-    ) -> String {
-        self.tree_with_mode(path, levels, exclude_paths, truncate, true)
-    }
-
-    fn tree_with_mode(
-        &self,
-        path: &str,
-        levels: Option<usize>,
-        exclude_paths: Option<&[String]>,
-        truncate: bool,
-        legacy: bool,
-    ) -> String {
+    fn execute_tree(&self, path: &str, levels: Option<usize>) -> String {
         if path.is_empty() {
             return "Error: missing or invalid path".to_string();
         }
@@ -317,14 +275,10 @@ impl ToolExecutor {
         }
 
         let mut lines = vec![path.to_string()];
-        lines.extend(self.generate_tree_lines(&real_path, levels, 1, exclude_paths));
+        lines.extend(self.generate_tree_lines(&real_path, levels, 1));
         let stdout = lines.join("\n");
         let remapped = self.remap(&stdout);
-        if truncate {
-            self.truncate_text(&remapped, legacy, false)
-        } else {
-            remapped
-        }
+        self.truncate_text(&remapped, TruncationProfile::General)
     }
 
     fn generate_tree_lines(
@@ -332,7 +286,6 @@ impl ToolExecutor {
         dir_path: &Path,
         max_depth: Option<usize>,
         current_depth: usize,
-        exclude_patterns: Option<&[String]>,
     ) -> Vec<String> {
         if max_depth.is_some_and(|depth| current_depth > depth) {
             return Vec::new();
@@ -350,23 +303,14 @@ impl ToolExecutor {
         let filtered = items
             .into_iter()
             .filter(|item| {
-                let Some(name) = item.file_name().and_then(OsStr::to_str) else {
+                let Some(_name) = item.file_name().and_then(OsStr::to_str) else {
                     return false;
                 };
                 let is_dir = item.is_dir();
                 if !self.is_visible_path(item, is_dir) {
                     return false;
                 }
-                if let Some(patterns) = exclude_patterns {
-                    let rel = item
-                        .strip_prefix(&self.root)
-                        .unwrap_or(item)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    !matches_any_pattern(patterns, name, &rel)
-                } else {
-                    true
-                }
+                true
             })
             .collect::<Vec<_>>();
 
@@ -383,8 +327,7 @@ impl ToolExecutor {
             lines.push(format!("{prefix}{name}"));
 
             if item.is_dir() {
-                let sub_lines =
-                    self.generate_tree_lines(item, max_depth, current_depth + 1, exclude_patterns);
+                let sub_lines = self.generate_tree_lines(item, max_depth, current_depth + 1);
                 let indent = if is_last { "    " } else { "│   " };
                 for sub_line in sub_lines {
                     lines.push(format!("{indent}{sub_line}"));
@@ -395,11 +338,7 @@ impl ToolExecutor {
         lines
     }
 
-    pub fn ls(&self, path: &str, long_format: bool, all_files: bool) -> String {
-        self.ls_with_mode(path, long_format, all_files, true)
-    }
-
-    fn ls_with_mode(&self, path: &str, long_format: bool, all_files: bool, legacy: bool) -> String {
+    fn execute_ls(&self, path: &str, long_format: bool, all_files: bool) -> String {
         if path.is_empty() {
             return "Error: missing or invalid path".to_string();
         }
@@ -422,7 +361,7 @@ impl ToolExecutor {
         }
 
         if !long_format {
-            return self.truncate_text(&entries.join("\n"), legacy, false);
+            return self.truncate_text(&entries.join("\n"), TruncationProfile::General);
         }
 
         let mut lines = vec![format!("total {}", entries.len())];
@@ -434,10 +373,10 @@ impl ToolExecutor {
                 "{type_char}rwxr-xr-x  1 user  staff {size:>8} Jan 01 00:00 {name}"
             ));
         }
-        self.truncate_text(&self.remap(&lines.join("\n")), legacy, false)
+        self.truncate_text(&self.remap(&lines.join("\n")), TruncationProfile::General)
     }
 
-    pub fn glob(&self, pattern: &str, path: &str, type_filter: &str) -> String {
+    fn execute_glob(&self, pattern: &str, path: &str, type_filter: &str) -> String {
         if pattern.is_empty() {
             return "Error: missing or invalid pattern".to_string();
         }
@@ -504,7 +443,7 @@ impl ToolExecutor {
         if out.is_empty() {
             "(no matches)".to_string()
         } else {
-            out
+            self.truncate_text(&out, TruncationProfile::General)
         }
     }
 
@@ -514,16 +453,15 @@ impl ToolExecutor {
         };
         let command_type = cmd.get("type").and_then(Value::as_str).unwrap_or_default();
         match command_type {
-            "rg" => self.rg_with_truncation(
+            "rg" => self.execute_rg(
                 cmd.get("pattern")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
                 cmd.get("path").and_then(Value::as_str).unwrap_or_default(),
                 string_array(cmd.get("include")).as_deref(),
                 string_array(cmd.get("exclude")).as_deref(),
-                false,
             ),
-            "readfile" => self.readfile_with_mode(
+            "readfile" => self.execute_readfile(
                 cmd.get("file").and_then(Value::as_str).unwrap_or_default(),
                 cmd.get("start_line")
                     .and_then(Value::as_u64)
@@ -531,37 +469,28 @@ impl ToolExecutor {
                 cmd.get("end_line")
                     .and_then(Value::as_u64)
                     .map(|value| value as usize),
-                false,
             ),
-            "tree" => self.tree_with_mode(
+            "tree" => self.execute_tree(
                 cmd.get("path").and_then(Value::as_str).unwrap_or_default(),
                 cmd.get("levels")
                     .and_then(Value::as_u64)
                     .map(|value| value as usize),
-                None,
-                true,
-                false,
             ),
-            "ls" => self.ls_with_mode(
+            "ls" => self.execute_ls(
                 cmd.get("path").and_then(Value::as_str).unwrap_or_default(),
                 cmd.get("long_format")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 cmd.get("all").and_then(Value::as_bool).unwrap_or(false),
-                false,
             ),
-            "glob" => self.truncate_text(
-                &self.glob(
-                    cmd.get("pattern")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    cmd.get("path").and_then(Value::as_str).unwrap_or_default(),
-                    cmd.get("type_filter")
-                        .and_then(Value::as_str)
-                        .unwrap_or("file"),
-                ),
-                false,
-                false,
+            "glob" => self.execute_glob(
+                cmd.get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                cmd.get("path").and_then(Value::as_str).unwrap_or_default(),
+                cmd.get("type_filter")
+                    .and_then(Value::as_str)
+                    .unwrap_or("file"),
             ),
             _ => format!("Error: unknown command type '{command_type}'"),
         }

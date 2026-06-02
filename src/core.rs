@@ -23,7 +23,6 @@ use repo::{RangeMap, parse_range_map_answer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::env;
 use std::future::Future;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -109,7 +108,7 @@ impl SearchOptions {
             app_version: None,
             ls_version: None,
             max_turns: 3,
-            max_commands: 6,
+            max_commands: 8,
             max_results: 10,
             tree_depth: 4,
             timeout_ms: 30_000,
@@ -193,12 +192,7 @@ where
         }
     };
 
-    let mut timeout_ms = options.timeout_ms;
-    if let Ok(raw_timeout) = env::var("TIMEOUT")
-        && let Some(value) = parse_timeout_seconds_ms(&raw_timeout)
-    {
-        timeout_ms = value;
-    }
+    let timeout_ms = options.timeout_ms;
 
     let jwt = match options.jwt.clone() {
         Some(jwt) => jwt,
@@ -227,7 +221,7 @@ where
     for warning in executor.path_filter_warnings() {
         log(&format!("Path filter warning: {warning}"));
     }
-    options.max_commands = options.max_commands.clamp(1, 6);
+    options.max_commands = options.max_commands.clamp(1, 8);
     let tool_defs = get_tool_definitions(options.max_commands);
     let system_prompt =
         build_system_prompt(options.max_turns, options.max_commands, options.max_results);
@@ -464,14 +458,6 @@ fn unique_patterns(patterns: Vec<String>) -> Vec<String> {
     unique
 }
 
-fn parse_timeout_seconds_ms(raw: &str) -> Option<u64> {
-    let value = raw.parse::<f64>().ok()?;
-    if !value.is_finite() || value <= 0.0 {
-        return None;
-    }
-    Some((value * 1000.0).trunc() as u64)
-}
-
 fn build_user_content(query: &str, repo_map: &RepoMap) -> String {
     format!(
         r#"Workspace scope snapshot (depth {}):
@@ -509,7 +495,7 @@ fn restricted_exec_commands(args: &Value, max_commands: usize) -> Vec<ExecutorTo
         }];
     };
 
-    (1..=max_commands.clamp(1, 6))
+    (1..=max_commands.clamp(1, 8))
         .filter_map(|idx| {
             let key = format!("command{idx}");
             map.get(&key).map(|command| ExecutorToolCall {

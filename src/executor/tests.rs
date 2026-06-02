@@ -53,7 +53,7 @@ fn executor_paths_are_clamped_to_root() {
 }
 
 #[test]
-fn readfile_supports_full_file_and_ranges() {
+fn exec_command_readfile_supports_full_file_and_ranges() {
     let tmp = TempDir::new().unwrap();
     let executor = ToolExecutor::new(tmp.path());
     fs::write(
@@ -62,22 +62,30 @@ fn readfile_supports_full_file_and_ranges() {
     )
     .unwrap();
 
-    let res = executor.readfile("/codebase/test.txt", None, None);
+    let res = executor.exec_command(&json!({
+        "type": "readfile",
+        "file": "/codebase/test.txt"
+    }));
     assert!(res.contains("1:line1\n2:line2\n3:line3\n4:line4\n5:line5"));
 
-    let res = executor.readfile("/codebase/test.txt", Some(2), Some(4));
+    let res = executor.exec_command(&json!({
+        "type": "readfile",
+        "file": "/codebase/test.txt",
+        "start_line": 2,
+        "end_line": 4
+    }));
     assert!(res.contains("2:line2\n3:line3\n4:line4"));
     assert!(!res.contains("1:line1"));
 
     assert!(
         executor
-            .readfile("/codebase/nonexistent.txt", None, None)
+            .exec_command(&json!({"type": "readfile", "file": "/codebase/nonexistent.txt"}))
             .contains("Error: file not found")
     );
 }
 
 #[test]
-fn tree_respects_depth_and_dotfile_filter() {
+fn exec_command_tree_respects_depth_and_dotfile_filter() {
     let tmp = TempDir::new().unwrap();
     let executor = ToolExecutor::new(tmp.path());
     fs::create_dir(tmp.path().join("dir1")).unwrap();
@@ -87,7 +95,11 @@ fn tree_respects_depth_and_dotfile_filter() {
     fs::write(tmp.path().join("file3.txt"), "").unwrap();
     fs::create_dir(tmp.path().join(".cache")).unwrap();
 
-    let res = executor.tree("/codebase", Some(2), Some(&["dist".to_string()]), true);
+    let res = executor.exec_command(&json!({
+        "type": "tree",
+        "path": "/codebase",
+        "levels": 2
+    }));
     assert!(res.contains("dir1"));
     assert!(res.contains("file1.py"));
     assert!(res.contains("dir2"));
@@ -98,23 +110,27 @@ fn tree_respects_depth_and_dotfile_filter() {
 }
 
 #[test]
-fn ls_supports_short_and_long_formats() {
+fn exec_command_ls_supports_short_and_long_formats() {
     let tmp = TempDir::new().unwrap();
     let executor = ToolExecutor::new(tmp.path());
     fs::write(tmp.path().join("file1.txt"), "").unwrap();
     fs::create_dir(tmp.path().join("dir1")).unwrap();
 
-    let res = executor.ls("/codebase", false, false);
+    let res = executor.exec_command(&json!({"type": "ls", "path": "/codebase"}));
     assert!(res.contains("dir1\nfile1.txt"));
 
-    let res = executor.ls("/codebase", true, false);
+    let res = executor.exec_command(&json!({
+        "type": "ls",
+        "path": "/codebase",
+        "long_format": true
+    }));
     assert!(res.contains("total 2"));
     assert!(res.contains("dir1"));
     assert!(res.contains("file1.txt"));
 }
 
 #[test]
-fn glob_supports_recursive_patterns() {
+fn exec_command_glob_supports_recursive_patterns() {
     let tmp = TempDir::new().unwrap();
     let executor = ToolExecutor::new(tmp.path());
     fs::create_dir(tmp.path().join("dir1")).unwrap();
@@ -123,7 +139,12 @@ fn glob_supports_recursive_patterns() {
     fs::write(tmp.path().join("dir2").join("test2.py"), "").unwrap();
     fs::write(tmp.path().join("other.txt"), "").unwrap();
 
-    let res = executor.glob("**/test*.py", "/codebase", "all");
+    let res = executor.exec_command(&json!({
+        "type": "glob",
+        "pattern": "**/test*.py",
+        "path": "/codebase",
+        "type_filter": "all"
+    }));
     assert!(res.contains("/codebase/dir1/test1.py"));
     assert!(res.contains("/codebase/dir2/test2.py"));
     assert!(!res.contains("other.txt"));
@@ -154,14 +175,23 @@ fn path_filter_applies_to_tree_glob_and_rg() {
     };
     let executor = ToolExecutor::with_limits_and_filter(tmp.path(), None, None, config);
 
-    let tree = executor.tree("/codebase", Some(3), None, false);
+    let tree = executor.exec_command(&json!({
+        "type": "tree",
+        "path": "/codebase",
+        "levels": 3
+    }));
     assert!(tree.contains("visible.txt"));
     assert!(tree.contains("keep.txt"));
     assert!(tree.contains("keep.log"));
     assert!(!tree.contains("skip.txt"));
     assert!(!tree.contains("drop.log"));
 
-    let glob = executor.glob("**/*", "/codebase", "file");
+    let glob = executor.exec_command(&json!({
+        "type": "glob",
+        "pattern": "**/*",
+        "path": "/codebase",
+        "type_filter": "file"
+    }));
     assert!(glob.contains("/codebase/visible.txt"));
     assert!(glob.contains("/codebase/ignored/keep.txt"));
     assert!(glob.contains("/codebase/logs/keep.log"));
@@ -170,7 +200,11 @@ fn path_filter_applies_to_tree_glob_and_rg() {
     assert!(!glob.contains("/codebase/logs/drop.log"));
 
     if Command::new("rg").arg("--version").output().is_ok() {
-        let result = executor.rg("needle", "/codebase", None, None);
+        let result = executor.exec_command(&json!({
+            "type": "rg",
+            "pattern": "needle",
+            "path": "/codebase"
+        }));
         assert!(result.contains("/codebase/visible.txt"));
         assert!(result.contains("/codebase/ignored/keep.txt"));
         assert!(result.contains("/codebase/logs/keep.log"));
@@ -181,7 +215,7 @@ fn path_filter_applies_to_tree_glob_and_rg() {
 }
 
 #[test]
-fn rg_includes_filename_for_single_file_results() {
+fn exec_command_rg_includes_filename_for_single_file_results() {
     if Command::new("rg").arg("--version").output().is_err() {
         return;
     }
@@ -190,7 +224,11 @@ fn rg_includes_filename_for_single_file_results() {
     fs::write(tmp.path().join("only.txt"), "needle").unwrap();
     let executor = ToolExecutor::new(tmp.path());
 
-    let result = executor.rg("needle", "/codebase", None, None);
+    let result = executor.exec_command(&json!({
+        "type": "rg",
+        "pattern": "needle",
+        "path": "/codebase"
+    }));
 
     assert!(result.contains("/codebase/only.txt:1:needle"));
 }
@@ -217,18 +255,18 @@ fn disabled_path_filter_uses_native_rg_traversal() {
     let native = ToolExecutor::with_limits_and_filter(tmp.path(), None, None, disabled_config);
 
     assert_eq!(
-        filtered.rg("needle", "/codebase", None, None),
+        filtered.exec_command(&json!({"type": "rg", "pattern": "needle", "path": "/codebase"})),
         "(no matches)"
     );
     assert!(
         native
-            .rg("needle", "/codebase", None, None)
+            .exec_command(&json!({"type": "rg", "pattern": "needle", "path": "/codebase"}))
             .contains("/codebase/visible.txt:1:needle")
     );
 }
 
 #[test]
-fn restricted_exec_commands_execute_with_official_subcommands() {
+fn exec_command_supports_all_subcommands() {
     let tmp = TempDir::new().unwrap();
     let executor = ToolExecutor::new(tmp.path());
     fs::create_dir(tmp.path().join("src")).unwrap();
@@ -316,26 +354,7 @@ fn exec_restricted_exec_step_marks_timed_out_when_budget_is_exceeded() {
 }
 
 #[test]
-fn legacy_readfile_keeps_existing_truncation_defaults() {
-    let tmp = TempDir::new().unwrap();
-    let executor = ToolExecutor::new(tmp.path());
-    let long_line = "a".repeat(400);
-    let contents = (1..=60)
-        .map(|_| long_line.clone())
-        .collect::<Vec<_>>()
-        .join("\n");
-    fs::write(tmp.path().join("test.txt"), contents).unwrap();
-
-    let output = executor.readfile("/codebase/test.txt", None, None);
-
-    assert!(output.contains("50:"));
-    assert!(!output.contains("51:"));
-    assert!(output.ends_with("... (lines truncated) ..."));
-    assert_eq!(output.lines().next().unwrap().len(), 250);
-}
-
-#[test]
-fn restricted_exec_readfile_uses_dedicated_defaults() {
+fn readfile_tool_uses_expanded_defaults() {
     let tmp = TempDir::new().unwrap();
     let executor = ToolExecutor::new(tmp.path());
     let long_line = "a".repeat(400);
@@ -354,7 +373,7 @@ fn restricted_exec_readfile_uses_dedicated_defaults() {
 }
 
 #[test]
-fn restricted_exec_ls_uses_new_shared_defaults() {
+fn general_tools_use_shared_defaults() {
     let tmp = TempDir::new().unwrap();
     let executor = ToolExecutor::new(tmp.path());
     for idx in 1..=90 {
@@ -369,7 +388,7 @@ fn restricted_exec_ls_uses_new_shared_defaults() {
 }
 
 #[test]
-fn fc_readfile_max_lines_only_affects_restricted_exec_readfile() {
+fn fc_readfile_max_lines_affects_readfile_tool() {
     let _guard = env_lock().lock().unwrap();
     remove_env_var("FC_RESULT_MAX_LINES");
     remove_env_var("FC_LINE_MAX_CHARS");
@@ -385,18 +404,15 @@ fn fc_readfile_max_lines_only_affects_restricted_exec_readfile() {
 
     let tool_output =
         executor.exec_command(&json!({"type": "readfile", "file": "/codebase/test.txt"}));
-    let legacy_output = executor.readfile("/codebase/test.txt", None, None);
 
     assert!(tool_output.contains("120:line-120"));
     assert!(!tool_output.contains("121:line-121"));
-    assert!(legacy_output.contains("50:line-50"));
-    assert!(!legacy_output.contains("51:line-51"));
 
     remove_env_var("FC_READFILE_MAX_LINES");
 }
 
 #[test]
-fn fc_result_max_lines_only_affects_windsurf_non_readfile_tools() {
+fn fc_result_max_lines_affects_general_tools() {
     let _guard = env_lock().lock().unwrap();
     set_env_var("FC_RESULT_MAX_LINES", "10");
     remove_env_var("FC_READFILE_MAX_LINES");
@@ -409,11 +425,9 @@ fn fc_result_max_lines_only_affects_windsurf_non_readfile_tools() {
     }
 
     let tool_output = executor.exec_command(&json!({"type": "ls", "path": "/codebase"}));
-    let legacy_output = executor.ls("/codebase", false, false);
 
     assert!(tool_output.contains("file_010.txt"));
     assert!(!tool_output.contains("file_011.txt"));
-    assert!(legacy_output.contains("file_011.txt"));
 
     remove_env_var("FC_RESULT_MAX_LINES");
 }

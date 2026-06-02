@@ -308,6 +308,12 @@ If addressing the issue requires modifying a method within a class, then you sho
   - tree: Display directory structure as a tree
     - Required: path (string)
     - Optional: levels (int)
+  - ls: List files in a directory
+    - Required: path (string)
+    - Optional: long_format (bool), all (bool)
+  - glob: Find files matching a glob pattern
+    - Required: pattern (string), path (string)
+    - Optional: type_filter ("file" | "directory" | "all")
 # THINKING RULES
 - Think step-by-step. Plan, reason, and reflect before each tool call.
 - Use tool calls liberally and purposefully to ground every conclusion in real code, not assumptions.
@@ -321,15 +327,15 @@ If addressing the issue requires modifying a method within a class, then you sho
 - Limit directory traversal with tree levels to quickly orient before deeper inspection.
 # SOME EXAMPLES OF WORKFLOWS
 - MAP
- Use `tree` with small levels; `rg` on likely roots to grasp structure and hotspots.
+ Use `tree` or `ls` on likely roots; `rg` to grasp structure and hotspots.
 - ANCHOR
- `rg` for problem keywords and anchor symbols; restrict by language globs via include.
+ `rg` for problem keywords and anchor symbols; use `glob` or include globs to narrow candidate files.
 - TRACE
  Follow imports with targeted `rg` in narrowed roots; open files with `readfile` scoped to entire semantic blocks.
 - VERIFY
  Confirm each candidate path exists by reading or additional searches; drop false positives (tests, vendored, generated) unless they must change.
 # TOOL USE GUIDELINES
-- You must use a SINGLE restricted_exec call in your answer, that lets you execute at most {max_commands} commands in a single turn. Each command must be an object with a `type` field of `rg`, `readfile`, or `tree` and the appropriate fields for that type.
+- You must use a SINGLE restricted_exec call in your answer, that lets you execute at most {max_commands} commands in a single turn. Each command must be an object with a `type` field of `rg`, `readfile`, `tree`, `ls`, or `glob` and the appropriate fields for that type.
 - Example restricted_exec usage:
 [TOOL_CALLS]restricted_exec[ARGS]{
   "command1": {
@@ -349,10 +355,21 @@ If addressing the issue requires modifying a method within a class, then you sho
     "type": "tree",
     "path": "/codebase/slime/",
     "levels": 2
+  },
+  "command4": {
+    "type": "glob",
+    "pattern": "**/*.py",
+    "path": "/codebase/slime/",
+    "type_filter": "file"
+  },
+  "command5": {
+    "type": "ls",
+    "path": "/codebase/slime/",
+    "all": false
   }
 }
 - You have at most {max_turns} turns to interact with the environment by calling tools, so issuing multiple commands at once is necessary and encouraged to speed up your research.
-- Each command result may be truncated to 50 lines; prefer multiple targeted reads/searches to build complete context.
+- Each command result may be truncated by tool-specific output limits; prefer multiple targeted reads/searches to build complete context.
 - DO NOT EVER USE MORE THAN {max_commands} commands in a single turn, or you will be penalized.
 # ANSWER FORMAT (strict format, including tags)
 - You will output an XML structure with a root element "ANSWER" containing "file" elements. Each "file" element will have a "path" attribute and contain "range" elements.
@@ -376,7 +393,7 @@ pub(crate) const FINAL_FORCE_ANSWER: &str =
     "You have no turns left. Now you MUST provide your final ANSWER, even if it's not complete.";
 
 pub fn get_tool_definitions(max_commands: usize) -> String {
-    let max_commands = max_commands.clamp(1, 6);
+    let max_commands = max_commands.clamp(1, 8);
     let command_schema = json!({
         "type": "object",
         "description": "Command to execute. Must be one of: rg, readfile, tree, ls, or glob.",
@@ -464,7 +481,7 @@ pub fn get_tool_definitions(max_commands: usize) -> String {
 }
 
 pub fn build_system_prompt(max_turns: usize, max_commands: usize, _max_results: usize) -> String {
-    let max_commands = max_commands.clamp(1, 6);
+    let max_commands = max_commands.clamp(1, 8);
     SYSTEM_PROMPT_TEMPLATE
         .replace("{max_commands}", &max_commands.to_string())
         .replace("{max_turns}", &max_turns.to_string())

@@ -9,6 +9,18 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruncationProfile {
+    General,
+    ReadfileExpanded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputLimits {
+    max_lines: usize,
+    line_max_chars: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolExecutionStatus {
     Pending,
@@ -44,11 +56,9 @@ pub struct InstantContextToolCall {
 pub struct ToolExecutor {
     root: PathBuf,
     collected_rg_patterns: Arc<Mutex<Vec<String>>>,
-    legacy_result_max_lines: usize,
-    legacy_line_max_chars: usize,
-    instant_context_result_max_lines: usize,
-    instant_context_readfile_max_lines: usize,
-    instant_context_line_max_chars: usize,
+    general_result_max_lines: usize,
+    readfile_result_max_lines: usize,
+    tool_line_max_chars: usize,
     path_filter: Arc<PathFilter>,
 }
 
@@ -85,21 +95,14 @@ impl ToolExecutor {
         Self {
             root,
             collected_rg_patterns: Arc::new(Mutex::new(Vec::new())),
-            legacy_result_max_lines: bounded_int(result_max_lines, 50, 1, 500),
-            legacy_line_max_chars: bounded_int(line_max_chars, 250, 20, 10_000),
-            instant_context_result_max_lines: bounded_int(
+            general_result_max_lines: bounded_int(
                 result_max_lines,
                 read_int_env("FC_RESULT_MAX_LINES", 80, 1, 500),
                 1,
                 500,
             ),
-            instant_context_readfile_max_lines: read_int_env(
-                "FC_READFILE_MAX_LINES",
-                200,
-                1,
-                10_000,
-            ),
-            instant_context_line_max_chars: bounded_int(
+            readfile_result_max_lines: read_int_env("FC_READFILE_MAX_LINES", 200, 1, 10_000),
+            tool_line_max_chars: bounded_int(
                 line_max_chars,
                 read_int_env("FC_LINE_MAX_CHARS", 300, 20, 10_000),
                 20,
@@ -165,38 +168,22 @@ impl ToolExecutor {
         remapped
     }
 
-    fn truncate_legacy(&self, text: &str) -> String {
-        self.truncate_with_limits(
-            text,
-            self.legacy_result_max_lines,
-            self.legacy_line_max_chars,
-        )
-    }
-
-    fn truncate_instant_context(&self, text: &str) -> String {
-        self.truncate_with_limits(
-            text,
-            self.instant_context_result_max_lines,
-            self.instant_context_line_max_chars,
-        )
-    }
-
-    fn truncate_instant_context_readfile(&self, text: &str) -> String {
-        self.truncate_with_limits(
-            text,
-            self.instant_context_readfile_max_lines,
-            self.instant_context_line_max_chars,
-        )
-    }
-
-    fn truncate_text(&self, text: &str, legacy: bool, readfile_tool: bool) -> String {
-        if legacy {
-            self.truncate_legacy(text)
-        } else if readfile_tool {
-            self.truncate_instant_context_readfile(text)
-        } else {
-            self.truncate_instant_context(text)
+    fn output_limits(&self, profile: TruncationProfile) -> OutputLimits {
+        match profile {
+            TruncationProfile::General => OutputLimits {
+                max_lines: self.general_result_max_lines,
+                line_max_chars: self.tool_line_max_chars,
+            },
+            TruncationProfile::ReadfileExpanded => OutputLimits {
+                max_lines: self.readfile_result_max_lines,
+                line_max_chars: self.tool_line_max_chars,
+            },
         }
+    }
+
+    fn truncate_text(&self, text: &str, profile: TruncationProfile) -> String {
+        let limits = self.output_limits(profile);
+        self.truncate_with_limits(text, limits.max_lines, limits.line_max_chars)
     }
 
     fn truncate_with_limits(&self, text: &str, max_lines: usize, line_max_chars: usize) -> String {

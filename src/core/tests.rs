@@ -52,6 +52,8 @@ fn build_system_prompt_uses_windsurf_context_subagent_contract() {
     assert!(prompt.contains("at most 3 turns"));
     assert!(prompt.contains("Think step-by-step"));
     assert!(prompt.contains("DO NOT EVER USE MORE THAN 6 commands"));
+    assert!(prompt.contains("ls: List files in a directory"));
+    assert!(prompt.contains("glob: Find files matching a glob pattern"));
     assert!(prompt.contains("[TOOL_CALLS]restricted_exec[ARGS]"));
     assert!(!prompt.contains("task_boundary"));
     assert!(!prompt.contains("notify_user"));
@@ -80,8 +82,8 @@ fn tool_definitions_expose_only_restricted_exec_and_answer() {
 
     let schema = &tools[0]["function"]["parameters"]["properties"];
     assert!(schema.get("command1").is_some());
-    assert!(schema.get("command6").is_some());
-    assert!(schema.get("command7").is_none());
+    assert!(schema.get("command8").is_some());
+    assert!(schema.get("command9").is_none());
 
     let serialized = serde_json::to_string(&defs).unwrap();
     assert!(serialized.contains("\"rg\""));
@@ -340,15 +342,6 @@ fn restricted_exec_results_hide_internal_status_timing_and_range_map() {
     assert!(!output.contains("duration_ms="));
     assert!(!output.contains("range_map:"));
     assert!(!output.contains("<range_map>"));
-}
-
-#[test]
-fn timeout_env_value_is_seconds() {
-    assert_eq!(parse_timeout_seconds_ms("30"), Some(30_000));
-    assert_eq!(parse_timeout_seconds_ms("1.5"), Some(1_500));
-    assert_eq!(parse_timeout_seconds_ms("0"), None);
-    assert_eq!(parse_timeout_seconds_ms("-1"), None);
-    assert_eq!(parse_timeout_seconds_ms("not-a-number"), None);
 }
 
 #[test]

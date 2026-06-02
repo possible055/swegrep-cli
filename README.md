@@ -125,11 +125,12 @@ Supported variables:
 | `WS_APP_VER` | `1.48.2` | Windsurf app version metadata |
 | `WS_LS_VER` | `1.9544.35` | Windsurf language server version metadata |
 | `SWEGREP_PATH_FILTER` | `1` | Enable shared path filtering; use `0`, `false`, `no`, or `off` to disable |
+| `FC_MAX_COMMANDS` | `8` | Max parallel restricted commands per search round |
 | `FC_RESULT_MAX_LINES` | `80` | Max lines for Windsurf-style non-`readfile` local tool results |
 | `FC_READFILE_MAX_LINES` | `200` | Max lines for Windsurf-style `readfile` tool output |
 | `FC_LINE_MAX_CHARS` | `300` | Max characters kept per line for Windsurf-style tool output |
-| `TURNS` | `3` | Default maximum search rounds for `search` |
-| `TIMEOUT` | `30000` | Streaming timeout in milliseconds |
+| `FC_MAX_TURNS` | `3` | Default maximum search rounds for `search` |
+| `FC_TIMEOUT_MS` | `30000` | Streaming timeout in milliseconds |
 
 ## Limitations
 
