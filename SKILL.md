@@ -32,9 +32,6 @@ DEPTH=4
 
 # Maximum search execution rounds/turns (3-5, default is 3)
 TURNS=3
-
-# Optional: Model selection identifier
-MODEL=gpt-5.5
 ```
 
 ---
