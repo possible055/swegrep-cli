@@ -1,0 +1,102 @@
+name: Release artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: swegrep-cli-linux-x86_64
+            archive: swegrep-cli-linux-x86_64.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: swegrep-cli-linux-aarch64
+            archive: swegrep-cli-linux-aarch64.tar.gz
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            artifact: swegrep-cli-windows-x86_64
+            archive: swegrep-cli-windows-x86_64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke test
+        if: runner.os != 'Windows'
+        run: ./target/${{ matrix.target }}/release/swegrep-cli --help
+
+      - name: Smoke test
+        if: runner.os == 'Windows'
+        run: .\target\${{ matrix.target }}\release\swegrep-cli.exe --help
+
+      - name: Package Linux artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          staging="dist/${{ matrix.artifact }}"
+          mkdir -p "$staging"
+          cp "target/${{ matrix.target }}/release/swegrep-cli" "$staging/"
+          cp README.md "$staging/"
+          cp LICENSE "$staging/"
+          tar -czf "dist/${{ matrix.archive }}" -C dist "${{ matrix.artifact }}"
+          cd dist
+          sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          $staging = "dist\${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\swegrep-cli.exe" $staging
+          Copy-Item README.md $staging
+          Copy-Item LICENSE $staging
+          Compress-Archive -Path $staging -DestinationPath "dist\${{ matrix.archive }}" -Force
+          Push-Location dist
+          $hash = (Get-FileHash "${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.archive }}" | Out-File -FilePath "${{ matrix.archive }}.sha256" -Encoding ascii
+          Pop-Location
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 30
