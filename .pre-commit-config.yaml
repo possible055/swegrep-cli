@@ -1,8 +1,6 @@
 minimum_pre_commit_version: "4.5.0"
 default_install_hook_types: [pre-commit, pre-push]
 default_stages: [pre-commit]
-default_language_version:
-  python: python3.11
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -11,8 +9,6 @@ repos:
       - id: check-yaml
       - id: check-toml
       - id: check-json
-      - id: check-ast
-      - id: debug-statements
       - id: end-of-file-fixer
       - id: trailing-whitespace
       - id: mixed-line-ending
@@ -22,41 +18,25 @@ repos:
       - id: check-case-conflict
       - id: detect-private-key
 
-  # Ruff — format first, then lint
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12
-    hooks:
-      - id: ruff-format
-        types: [python]
-      - id: ruff-check
-        args: ["--fix"]
-        types: [python]
-
   - repo: local
     hooks:
-      # uv lockfile sync — ensure uv.lock matches pyproject.toml
-      - id: uv-lock-check
-        name: uv lock check
-        entry: uv lock --locked
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
         language: system
-        files: '(pyproject\.toml|uv\.lock)$'
+        files: '^(Cargo\.(toml|lock)|rust-toolchain\.toml|src/.*\.rs)$'
         pass_filenames: false
 
-      # Python type check — dmypy daemon
-      - id: dmypy
-        name: mypy (dmypy daemon)
-        entry: uv run --frozen --group dev -- dmypy
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets --all-features -- -D warnings
         language: system
-        args:
-          ["run", "--timeout", "7200", "--", "--config-file=pyproject.toml", "--cache-fine-grained", "--no-error-summary", "src/swegrep_cli"]
-        files: '^(src/.*\.py|pyproject\.toml)$'
+        files: '^(Cargo\.(toml|lock)|rust-toolchain\.toml|src/.*\.rs)$'
         pass_filenames: false
-        require_serial: true
 
-      # Python security scan — keep src/ as the local security boundary
-      - id: bandit
-        name: bandit (src)
-        entry: uv run --group dev -- bandit -r src/ -c pyproject.toml
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test
         language: system
-        files: '^(src/.*\.py|pyproject\.toml)$'
+        files: '^(Cargo\.(toml|lock)|rust-toolchain\.toml|src/.*\.rs)$'
         pass_filenames: false

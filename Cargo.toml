@@ -1,0 +1,31 @@
+[package]
+name = "swegrep-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96.0"
+description = "AI-powered Agentic Code Search CLI"
+readme = "README.md"
+license = "MIT"
+
+[[bin]]
+name = "swegrep-cli"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+flate2 = "1"
+globset = "0.4"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
+tempfile = "3"

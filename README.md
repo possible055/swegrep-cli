@@ -4,10 +4,24 @@ AI-powered Agentic Code Search CLI powered by Windsurf's SWE-grep protocol.
 
 ## Requirements
 
-- Python 3.11+
+- Rust 1.96.0+
 - `ripgrep` (`rg`) installed and available in `PATH`
 - A logged-in Windsurf installation, or a Windsurf API key
-- No runtime Python package dependencies outside the standard library
+
+## Install / Build
+
+```bash
+cargo build --release
+./target/release/swegrep-cli --help
+```
+
+For local development:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
 
 ## Windsurf API Key
 
@@ -54,6 +68,9 @@ You can configure internal metadata or constraints through environment variables
 | `WS_LS_VER` | `1.9544.35` | Windsurf language server version metadata |
 | `FC_RESULT_MAX_LINES` | `50` | Max lines per local tool result |
 | `FC_LINE_MAX_CHARS` | `250` | Max characters per local tool output line |
+| `DEPTH` | `4` | Directory tree depth for initial repo map |
+| `TURNS` | `3` | Maximum search rounds |
+| `TIMEOUT` | `30000` | Streaming timeout in milliseconds |
 
 ## Caveats
 

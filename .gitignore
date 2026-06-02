@@ -1,26 +1,18 @@
-# Python
-__pycache__/
-*.pyc
-*.egg-info/
-*.egg
-
-# Virtual environment / Package manager
+# Package managers / dependencies
+node_modules/
 .venv/
 .uv-cache/
-node_modules/
 
 # Build / Distribution
+target/
 build/
 dist/
 *.tsbuildinfo
 
-# Testing / Coverage / Linter / Type checker
-.pytest_cache/
+# Testing / Coverage / Linter
 .coverage
-.pylint.d/
-.ruff_cache/
-.mypy_cache/
-.dmypy.json
+__pycache__/
+*.pyc
 
 # IDE / Editor / AI agent
 .vscode/
@@ -39,9 +31,9 @@ CLAUDE.md
 
 # Project-specific
 .lock-index/
-.import_linter_cache
 .dev
 .repos
+target/
 
 # Logs / Env
 *.log

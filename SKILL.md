@@ -1,6 +1,6 @@
 # swegrep-cli Skill Configuration Guide
 
-This CLI is designed to be packaged and executed as an agentic AI skill. To customize behavior when called by tools or systems, you can place environment and exclusion configuration files inside the native `swegrep` configuration directory.
+This Rust CLI is designed to be packaged and executed as an agentic AI skill. Build it with `cargo build --release`, then expose `target/release/swegrep-cli` to the caller. To customize behavior when called by tools or systems, place environment and exclusion configuration files inside the native `swegrep` configuration directory.
 
 ## Configuration Paths
 
@@ -49,15 +49,13 @@ You can globally exclude certain file names or directory paths from the initial 
 
 ### Example Content
 ```text
-# Exclude Python build directories and cache
+# Exclude build directories and cache
 dist
 build
-__pycache__
-*.pyc
+target
 
 # Exclude packages
 node_modules
-.venv
 .git
 ```
 
