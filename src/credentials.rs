@@ -148,27 +148,44 @@ pub fn looks_truncated_api_key(value: &str) -> bool {
 }
 
 pub fn get_windsurf_db_path() -> Result<PathBuf, String> {
+    let candidates = get_auth_db_path_candidates()?;
+    if let Some(existing) = candidates.iter().find(|path| path.exists()) {
+        return Ok(existing.clone());
+    }
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| "Cannot determine auth database path".to_string())
+}
+
+fn auth_db_path(base: &Path, app_name: &str) -> PathBuf {
+    base.join(app_name)
+        .join("User")
+        .join("globalStorage")
+        .join("state.vscdb")
+}
+
+fn get_auth_db_path_candidates() -> Result<Vec<PathBuf>, String> {
     let home = home_dir();
 
     if cfg!(target_os = "macos") {
-        return Ok(home
-            .join("Library")
-            .join("Application Support")
-            .join("Windsurf")
-            .join("User")
-            .join("globalStorage")
-            .join("state.vscdb"));
+        let app_support = home.join("Library").join("Application Support");
+        return Ok(vec![
+            auth_db_path(&app_support, "Windsurf"),
+            auth_db_path(&app_support, "devin"),
+        ]);
     }
 
     if cfg!(target_os = "windows") {
         let appdata = env::var_os("APPDATA").ok_or("Cannot determine APPDATA path")?;
-        return Ok(PathBuf::from(appdata)
-            .join("Windsurf")
-            .join("User")
-            .join("globalStorage")
-            .join("state.vscdb"));
+        let appdata = PathBuf::from(appdata);
+        return Ok(vec![
+            auth_db_path(&appdata, "Windsurf"),
+            auth_db_path(&appdata, "devin"),
+        ]);
     }
 
+    let mut candidates = Vec::new();
     let c_users = Path::new("/mnt/c/Users");
     if c_users.exists()
         && let Ok(users) = fs::read_dir(c_users)
@@ -184,54 +201,81 @@ pub fn get_windsurf_db_path() -> Result<PathBuf, String> {
             if name.starts_with('.') {
                 continue;
             }
-            let candidate = user_dir
-                .join("AppData")
-                .join("Roaming")
-                .join("Windsurf")
-                .join("User")
-                .join("globalStorage")
-                .join("state.vscdb");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
+            let roaming = user_dir.join("AppData").join("Roaming");
+            candidates.push(auth_db_path(&roaming, "Windsurf"));
+            candidates.push(auth_db_path(&roaming, "devin"));
         }
     }
 
     let config_dir = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
-    Ok(config_dir
-        .join("Windsurf")
-        .join("User")
-        .join("globalStorage")
-        .join("state.vscdb"))
+    candidates.push(auth_db_path(&config_dir, "Windsurf"));
+    candidates.push(auth_db_path(&config_dir, "devin"));
+    Ok(candidates)
 }
 
 pub fn extract_key(db_path: Option<&Path>) -> ExtractKeyResult {
-    let path = match db_path {
-        Some(path) => path.to_path_buf(),
-        None => match get_windsurf_db_path() {
-            Ok(path) => path,
-            Err(err) => {
-                return ExtractKeyResult::error(
-                    format!("Cannot determine database path: {err}"),
-                    "",
-                );
-            }
-        },
+    if let Some(path) = db_path {
+        return extract_key_from_path(path);
+    }
+
+    let candidates = match get_auth_db_path_candidates() {
+        Ok(paths) => paths,
+        Err(err) => {
+            return ExtractKeyResult::error(format!("Cannot determine database path: {err}"), "");
+        }
     };
 
+    extract_key_from_candidates(&candidates)
+}
+
+fn extract_key_from_candidates(candidates: &[PathBuf]) -> ExtractKeyResult {
+    let mut attempted = Vec::new();
+    let mut first_error = None;
+    for path in candidates {
+        if !path.exists() {
+            attempted.push(path.to_string_lossy().into_owned());
+            continue;
+        }
+        let result = extract_key_from_path(path);
+        if result.api_key.is_some() {
+            return result;
+        }
+        if first_error.is_none() {
+            first_error = result.error.clone();
+        }
+        attempted.push(path.to_string_lossy().into_owned());
+    }
+
+    if let Some(error) = first_error {
+        return ExtractKeyResult::error_with_hint(
+            error,
+            format!("Checked auth databases: {}", attempted.join(", ")),
+            attempted.first().cloned().unwrap_or_default(),
+        );
+    }
+
+    let fallback = candidates.first().cloned().unwrap_or_default();
+    ExtractKeyResult::error_with_hint(
+        format!("Auth database not found: {}", fallback.display()),
+        format!("Checked auth databases: {}", attempted.join(", ")),
+        fallback.to_string_lossy(),
+    )
+}
+
+fn extract_key_from_path(path: &Path) -> ExtractKeyResult {
     if !path.exists() {
         return ExtractKeyResult::error_with_hint(
-            format!("Windsurf database not found: {}", path.display()),
-            "Ensure Windsurf is installed and logged in.",
+            format!("Auth database not found: {}", path.display()),
+            "Ensure Windsurf or Devin is installed and logged in.",
             path.to_string_lossy(),
         );
     }
 
-    let conn = match Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+    let conn = match Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
         Ok(conn) => conn,
-        Err(_) => match Connection::open(&path) {
+        Err(_) => match Connection::open(path) {
             Ok(conn) => conn,
             Err(err) => {
                 return ExtractKeyResult::error(
@@ -242,7 +286,7 @@ pub fn extract_key(db_path: Option<&Path>) -> ExtractKeyResult {
         },
     };
 
-    let extraction = extract_key_from_connection(&conn, &path);
+    let extraction = extract_key_from_connection(&conn, path);
     extraction.unwrap_or_else(|err| ExtractKeyResult::error(err, path.to_string_lossy()))
 }
 
@@ -324,6 +368,15 @@ mod tests {
         .unwrap();
     }
 
+    fn write_empty_auth_db(db_path: &Path) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn save_and_load_cache() {
         let tmp = TempDir::new().unwrap();
@@ -355,12 +408,7 @@ mod tests {
     fn extract_key_missing_record() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("state.vscdb");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
-            [],
-        )
-        .unwrap();
+        write_empty_auth_db(&db_path);
 
         let result = extract_key(Some(&db_path));
         assert!(
@@ -370,6 +418,28 @@ mod tests {
                 .unwrap()
                 .contains("windsurfAuthStatus record not found")
         );
+    }
+
+    #[test]
+    fn extract_key_from_candidates_tries_next_database() {
+        let tmp = TempDir::new().unwrap();
+        let windsurf_db_path = tmp.path().join("Windsurf").join("state.vscdb");
+        let devin_db_path = tmp.path().join("devin").join("state.vscdb");
+        fs::create_dir_all(windsurf_db_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(devin_db_path.parent().unwrap()).unwrap();
+        write_empty_auth_db(&windsurf_db_path);
+        write_auth_db(
+            &devin_db_path,
+            json!({ "apiKey": "devin-session-token$eyJhbGciOiJIUzI1NiJ9.payload.signature" }),
+        );
+
+        let result = extract_key_from_candidates(&[windsurf_db_path, devin_db_path.clone()]);
+
+        assert_eq!(
+            result.api_key.as_deref(),
+            Some("devin-session-token$eyJhbGciOiJIUzI1NiJ9.payload.signature")
+        );
+        assert_eq!(result.db_path, devin_db_path.to_string_lossy());
     }
 
     #[test]
@@ -431,7 +501,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("Windsurf database not found")
+                .contains("Auth database not found")
         );
     }
 }

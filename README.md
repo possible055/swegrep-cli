@@ -40,8 +40,8 @@ assets for:
 - Windows x86_64
 
 ```bash
-git tag v0.1.0
-git push origin main v0.1.0
+git tag v0.1.1
+git push origin main v0.1.1
 ```
 
 ## Usage
@@ -94,6 +94,9 @@ Auto-discovery looks for `state.vscdb` in these locations:
 | Windows | `%APPDATA%/Windsurf/User/globalStorage/state.vscdb` |
 | Linux | `$XDG_CONFIG_HOME/Windsurf/User/globalStorage/state.vscdb` or `~/.config/Windsurf/User/globalStorage/state.vscdb` |
 | WSL | First matching `/mnt/c/Users/*/AppData/Roaming/Windsurf/User/globalStorage/state.vscdb`, then the Linux fallback above |
+
+Recent Devin builds use the same `state.vscdb` format under `devin/User/globalStorage`.
+Auto-discovery checks the matching `devin` paths after the Windsurf paths.
 
 ## Path Filtering
 
