@@ -41,11 +41,7 @@ struct SearchArgs {
     #[arg(long, help = "Windsurf API key. Overrides env and config.")]
     api_key: Option<String>,
 
-    #[arg(
-        long,
-        default_value = ".",
-        help = "Absolute or relative path to project root. Default is current directory."
-    )]
+    #[arg(long, help = "Absolute or relative path to project root.")]
     path: PathBuf,
 
     #[arg(

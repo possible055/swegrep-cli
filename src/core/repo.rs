@@ -1,7 +1,6 @@
 use crate::executor::ToolExecutor;
 use crate::path_filter::PathFilterConfig;
 use regex::Regex;
-use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 
@@ -166,115 +165,6 @@ fn capped_root_manifest(project_root: &Path, entries: Vec<std::path::PathBuf>) -
     tree
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct RangeMap {
-    ranges: BTreeMap<String, Vec<(usize, usize)>>,
-}
-
-impl RangeMap {
-    pub(crate) fn add_range(&mut self, path: &str, start: usize, end: usize) {
-        let Some(rel) = safe_codebase_rel(path) else {
-            return;
-        };
-        if start == 0 || end == 0 {
-            return;
-        }
-        let (start, end) = if start <= end {
-            (start, end)
-        } else {
-            (end, start)
-        };
-        self.ranges.entry(rel).or_default().push((start, end));
-    }
-
-    pub(crate) fn merge_search_result(&mut self, result: &SearchResult) {
-        for file in &result.files {
-            for (start, end) in &file.ranges {
-                self.add_range(&file.path, *start, *end);
-            }
-        }
-    }
-
-    pub(crate) fn merge_tool_output(&mut self, command: &serde_json::Value, output: &str) {
-        match command
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-        {
-            "rg" => self.merge_rg_output(output),
-            "readfile" => self.merge_readfile_output(command, output),
-            _ => {}
-        }
-    }
-
-    pub(crate) fn to_result(&self, project_root: &Path, max_results: usize) -> SearchResult {
-        let resolved_root = project_root
-            .canonicalize()
-            .unwrap_or_else(|_| project_root.to_path_buf());
-        let mut files = Vec::new();
-        for (path, ranges) in &self.ranges {
-            if files.len() >= max_results {
-                break;
-            }
-            let ranges = merged_ranges(ranges);
-            if ranges.is_empty() {
-                continue;
-            }
-            files.push(FileEntry {
-                path: path.clone(),
-                full_path: resolved_root.join(path).to_string_lossy().into_owned(),
-                ranges,
-            });
-        }
-        SearchResult {
-            files,
-            ..SearchResult::default()
-        }
-    }
-
-    fn merge_rg_output(&mut self, output: &str) {
-        let regex = Regex::new(r"(?m)^/codebase/([^:\n]+):(\d+):").unwrap();
-        for capture in regex.captures_iter(output) {
-            let Some(path) = capture.get(1).map(|m| m.as_str()) else {
-                continue;
-            };
-            let Some(line) = capture
-                .get(2)
-                .and_then(|m| m.as_str().parse::<usize>().ok())
-            else {
-                continue;
-            };
-            self.add_range(path, line, line);
-        }
-    }
-
-    fn merge_readfile_output(&mut self, command: &serde_json::Value, output: &str) {
-        let Some(file) = command.get("file").and_then(serde_json::Value::as_str) else {
-            return;
-        };
-        let lines = output
-            .lines()
-            .filter_map(|line| line.split_once(':')?.0.parse::<usize>().ok())
-            .collect::<Vec<_>>();
-        if let (Some(start), Some(end)) = (lines.iter().min(), lines.iter().max()) {
-            self.add_range(file, *start, *end);
-            return;
-        }
-
-        let start = command
-            .get("start_line")
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(1);
-        let end = command
-            .get("end_line")
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(start);
-        self.add_range(file, start, end);
-    }
-}
-
 pub fn parse_answer(xml_text: &str, project_root: &Path) -> SearchResult {
     let mut files = Vec::new();
     let resolved_root = project_root
@@ -291,22 +181,9 @@ pub fn parse_answer(xml_text: &str, project_root: &Path) -> SearchResult {
         let Some(rel) = safe_codebase_rel(vpath) else {
             continue;
         };
-
-        let full_path = resolved_root.join(&rel);
-        let ranges = range_regex
-            .captures_iter(body)
-            .filter_map(|range| {
-                let start = range.get(1)?.as_str().parse::<usize>().ok()?;
-                let end = range.get(2)?.as_str().parse::<usize>().ok()?;
-                Some((start, end))
-            })
-            .collect::<Vec<_>>();
-
-        files.push(FileEntry {
-            path: rel,
-            full_path: full_path.to_string_lossy().into_owned(),
-            ranges,
-        });
+        if let Some(file) = parse_answer_file(&resolved_root, rel, body, &range_regex) {
+            files.push(file);
+        }
     }
 
     SearchResult {
@@ -315,16 +192,68 @@ pub fn parse_answer(xml_text: &str, project_root: &Path) -> SearchResult {
     }
 }
 
-pub(crate) fn parse_range_map_answer(
-    xml_text: &str,
-    project_root: &Path,
-    range_map: &RangeMap,
-    max_results: usize,
-) -> SearchResult {
-    let mut merged = range_map.clone();
-    let parsed = parse_answer(xml_text, project_root);
-    merged.merge_search_result(&parsed);
-    merged.to_result(project_root, max_results)
+fn parse_answer_file(
+    resolved_root: &Path,
+    rel: String,
+    body: &str,
+    range_regex: &Regex,
+) -> Option<FileEntry> {
+    let full_path = resolved_root.join(&rel);
+    let full_path = full_path.canonicalize().ok()?;
+    if !full_path.is_file() || !full_path.starts_with(resolved_root) {
+        return None;
+    }
+
+    let line_count = file_line_count(&full_path).ok()?;
+    if line_count == 0 {
+        return None;
+    }
+
+    let ranges = range_regex
+        .captures_iter(body)
+        .filter_map(|range| {
+            let start = range.get(1)?.as_str().parse::<usize>().ok()?;
+            let end = range.get(2)?.as_str().parse::<usize>().ok()?;
+            normalize_answer_range(start, end, line_count)
+        })
+        .collect::<Vec<_>>();
+    if ranges.is_empty() {
+        return None;
+    }
+
+    Some(FileEntry {
+        path: rel,
+        full_path: full_path.to_string_lossy().into_owned(),
+        ranges,
+    })
+}
+
+fn file_line_count(path: &Path) -> std::io::Result<usize> {
+    let content = std::fs::read(path)?;
+    if content.is_empty() {
+        return Ok(0);
+    }
+    let newline_count = content.iter().filter(|byte| **byte == b'\n').count();
+    if content.last() == Some(&b'\n') {
+        Ok(newline_count)
+    } else {
+        Ok(newline_count + 1)
+    }
+}
+
+fn normalize_answer_range(start: usize, end: usize, line_count: usize) -> Option<(usize, usize)> {
+    if start == 0 || end == 0 {
+        return None;
+    }
+    let (start, end) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    if start > line_count {
+        return None;
+    }
+    Some((start, end.min(line_count)))
 }
 
 fn safe_codebase_rel(path: &str) -> Option<String> {
@@ -346,34 +275,6 @@ fn safe_codebase_rel(path: &str) -> Option<String> {
         return None;
     }
     Some(rel)
-}
-
-fn merged_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    let mut ranges = ranges
-        .iter()
-        .copied()
-        .filter(|(start, end)| *start > 0 && *end > 0)
-        .map(|(start, end)| {
-            if start <= end {
-                (start, end)
-            } else {
-                (end, start)
-            }
-        })
-        .collect::<Vec<_>>();
-    ranges.sort_unstable();
-
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for (start, end) in ranges {
-        if let Some((_, last_end)) = merged.last_mut()
-            && start <= *last_end + 1
-        {
-            *last_end = (*last_end).max(end);
-            continue;
-        }
-        merged.push((start, end));
-    }
-    merged
 }
 
 #[cfg(test)]
@@ -401,6 +302,11 @@ mod tests {
         </ANSWER>
         "#;
         let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::create_dir_all(tmp.path().join("tests")).unwrap();
+        fs::write(tmp.path().join("src/main.py"), numbered_lines(40)).unwrap();
+        fs::write(tmp.path().join("tests/test_main.py"), numbered_lines(5)).unwrap();
+
         let result = parse_answer(xml, tmp.path());
         assert_eq!(result.files.len(), 2);
         assert_eq!(result.files[0].path, "src/main.py");
@@ -410,42 +316,36 @@ mod tests {
     }
 
     #[test]
-    fn range_map_merges_ranges_and_rejects_path_traversal() {
+    fn parse_answer_validates_files_and_ranges() {
+        let xml = r#"
+        <ANSWER>
+          <file path="/codebase/src/lib.rs">
+            <range>4-2</range>
+            <range>3-20</range>
+            <range>0-2</range>
+            <range>9-10</range>
+          </file>
+          <file path="/codebase/src/missing.rs">
+            <range>1-1</range>
+          </file>
+          <file path="/codebase/src/empty.rs">
+            <range>1-1</range>
+          </file>
+          <file path="/codebase/src/no_ranges.rs">
+          </file>
+        </ANSWER>
+        "#;
         let tmp = TempDir::new().unwrap();
-        let mut range_map = RangeMap::default();
-        range_map.add_range("/codebase/src/lib.rs", 10, 20);
-        range_map.add_range("src/lib.rs", 18, 30);
-        range_map.add_range("/codebase/src/lib.rs", 31, 35);
-        range_map.add_range("/codebase/../../etc/passwd", 1, 2);
-        range_map.add_range("/codebase/src/main.rs", 2, 2);
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/lib.rs"), numbered_lines(6)).unwrap();
+        fs::write(tmp.path().join("src/empty.rs"), "").unwrap();
+        fs::write(tmp.path().join("src/no_ranges.rs"), numbered_lines(1)).unwrap();
 
-        let result = range_map.to_result(tmp.path(), 10);
+        let result = parse_answer(xml, tmp.path());
 
-        assert_eq!(result.files.len(), 2);
+        assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].path, "src/lib.rs");
-        assert_eq!(result.files[0].ranges, vec![(10, 35)]);
-        assert_eq!(result.files[1].path, "src/main.rs");
-        assert_eq!(result.files[1].ranges, vec![(2, 2)]);
-    }
-
-    #[test]
-    fn parse_range_map_answer_merges_final_xml_and_limits_results() {
-        let tmp = TempDir::new().unwrap();
-        let mut range_map = RangeMap::default();
-        range_map.add_range("/codebase/src/a.rs", 1, 3);
-        range_map.add_range("/codebase/src/b.rs", 5, 6);
-
-        let result = parse_range_map_answer(
-            r#"<ANSWER><file path="/codebase/src/a.rs"><range>4-8</range></file><file path="/codebase/src/c.rs"><range>1-1</range></file></ANSWER>"#,
-            tmp.path(),
-            &range_map,
-            2,
-        );
-
-        assert_eq!(result.files.len(), 2);
-        assert_eq!(result.files[0].path, "src/a.rs");
-        assert_eq!(result.files[0].ranges, vec![(1, 8)]);
-        assert_eq!(result.files[1].path, "src/b.rs");
+        assert_eq!(result.files[0].ranges, vec![(2, 4), (3, 6)]);
     }
 
     #[test]
@@ -459,6 +359,13 @@ mod tests {
         assert!(!result.tree.contains("... (lines truncated) ..."));
         assert!(result.tree.contains("file_059.txt"));
         assert_eq!(result.size_bytes, result.tree.len());
+    }
+
+    fn numbered_lines(count: usize) -> String {
+        (1..=count)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]

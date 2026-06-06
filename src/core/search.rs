@@ -13,7 +13,7 @@ use super::protocol::{
     ChatMessage, FINAL_FORCE_ANSWER, ParsedModelTurn, build_request, build_system_prompt,
     get_tool_definitions, parse_response, trim_messages,
 };
-use super::repo::{RangeMap, RepoMap, get_repo_map, parse_range_map_answer};
+use super::repo::{RepoMap, get_repo_map, parse_answer};
 use super::types::{SearchMeta, SearchOptions, SearchResult};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,7 +134,6 @@ where
     let total_api_calls = options.max_turns + 1;
     const MAX_COMPENSATED_TURNS: usize = 2;
     let mut force_answer_injected = false;
-    let mut range_map = RangeMap::default();
     let mut compensated_turns = 0_usize;
     let mut turn = 0_usize;
 
@@ -247,20 +246,14 @@ where
             ParsedModelTurn::Text(text) => {
                 if text.contains("<ANSWER") {
                     log("Received final answer");
-                    let mut result = parse_range_map_answer(
-                        &text,
-                        &project_root,
-                        &range_map,
-                        options.max_results,
-                    );
+                    let mut result = parse_answer(&text, &project_root);
+                    result.files.truncate(options.max_results);
                     result.rg_patterns = unique_patterns(executor.collected_rg_patterns());
                     result.meta = search_meta(&project_root, &repo_map, None);
                     return result;
                 }
                 return SearchResult {
-                    files: range_map
-                        .to_result(&project_root, options.max_results)
-                        .files,
+                    files: Vec::new(),
                     rg_patterns: unique_patterns(executor.collected_rg_patterns()),
                     raw_response: Some(text),
                     error: None,
@@ -276,8 +269,8 @@ where
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             log("Received final answer");
-            let mut result =
-                parse_range_map_answer(answer_xml, &project_root, &range_map, options.max_results);
+            let mut result = parse_answer(answer_xml, &project_root);
+            result.files.truncate(options.max_results);
             result.rg_patterns = unique_patterns(executor.collected_rg_patterns());
             result.meta = search_meta(&project_root, &repo_map, None);
             return result;
@@ -345,11 +338,6 @@ where
         let timeout_budget_ms = (timeout_ms as u128 / 2).max(1_000);
         let updates =
             executor.exec_restricted_exec_step(&step.id, &step.tool_calls, timeout_budget_ms);
-        for update in &updates {
-            if update.status == ToolExecutionStatus::Completed {
-                range_map.merge_tool_output(&update.command, &update.output);
-            }
-        }
         let results = format_restricted_exec_results(&updates);
 
         messages.push(ChatMessage {
@@ -638,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_exec_results_hide_internal_status_timing_and_range_map() {
+    fn restricted_exec_results_hide_internal_status_and_timing() {
         let updates = vec![
             InstantContextToolUpdate {
                 step_id: "step-1".to_string(),
@@ -666,8 +654,6 @@ mod tests {
         assert!(output.contains("command2_result:\nError: tool timed out"));
         assert!(!output.contains("status="));
         assert!(!output.contains("duration_ms="));
-        assert!(!output.contains("range_map:"));
-        assert!(!output.contains("<range_map>"));
     }
 
     #[tokio::test]
@@ -714,7 +700,7 @@ mod tests {
 
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].path, "test.txt");
-        assert_eq!(result.files[0].ranges, vec![(1, 10)]);
+        assert_eq!(result.files[0].ranges, vec![(1, 2)]);
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 
@@ -863,7 +849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_loop_keeps_range_map_internal_but_merges_final_result() {
+    async fn search_loop_empty_answer_does_not_fallback_to_tool_history() {
         let t1_frame = connect_frame_encode(
             br#"{"output":"read context","tool_calls":[{"id":"q1","name":"restricted_exec","args":{"command1":{"type":"readfile","file":"/codebase/test.txt","start_line":1,"end_line":2}}}]}"#,
             false,
@@ -903,9 +889,7 @@ mod tests {
         })
         .await;
 
-        assert_eq!(result.files.len(), 1);
-        assert_eq!(result.files[0].path, "test.txt");
-        assert_eq!(result.files[0].ranges, vec![(1, 2)]);
+        assert!(result.files.is_empty());
 
         let requests = requests.lock().unwrap();
         assert!(requests[0].contains("Workspace scope snapshot (depth "));
@@ -914,8 +898,43 @@ mod tests {
         assert!(requests[1].contains("command1_result:"));
         assert!(!requests[1].contains("status="));
         assert!(!requests[1].contains("duration_ms="));
-        assert!(!requests[1].contains("range_map:"));
-        assert!(!requests[1].contains("<range_map>"));
+    }
+
+    #[tokio::test]
+    async fn search_loop_uses_final_answer_without_tool_history_ranges() {
+        let t1_frame = connect_frame_encode(
+            br#"{"output":"read context","tool_calls":[{"id":"q1","name":"restricted_exec","args":{"command1":{"type":"readfile","file":"/codebase/test.txt","start_line":1,"end_line":2}}}]}"#,
+            false,
+        );
+
+        let mut t2_encoder = ProtobufEncoder::new();
+        t2_encoder.write_string(
+            1,
+            r#"[TOOL_CALLS]answer[ARGS]{"answer": "<ANSWER><file path=\"/codebase/test.txt\"><range>3-3</range></file></ANSWER>"}"#,
+        );
+        let t2_frame = connect_frame_encode(&t2_encoder.to_bytes(), false);
+
+        let responses = Arc::new(Mutex::new(VecDeque::from([t1_frame, t2_frame])));
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("test.txt"), "line1\nline2\nline3").unwrap();
+
+        let mut options = SearchOptions::new("find test", tmp.path());
+        options.api_key = Some("sk-ws-01-key".to_string());
+        options.jwt = Some("mocked.jwt.token".to_string());
+        options.max_turns = 2;
+
+        let result = search_with_streaming(options, None, {
+            let responses = Arc::clone(&responses);
+            move |_, _, _, _| {
+                let responses = Arc::clone(&responses);
+                async move { Ok(responses.lock().unwrap().pop_front().unwrap()) }
+            }
+        })
+        .await;
+
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, "test.txt");
+        assert_eq!(result.files[0].ranges, vec![(3, 3)]);
     }
 
     #[tokio::test]

@@ -56,11 +56,12 @@ Optional flags:
 
 ```bash
 swegrep-cli search "query" \
-  --path . \
+  --path /path/to/project \
   --api-key sk-ws-01-... \
   --turns 3
 ```
 
+- `--path` is required and should point to the project root.
 - `--turns` accepts values from `3` to `5`.
 
 ### Extract a Windsurf API Key

@@ -241,6 +241,9 @@ impl ToolExecutor {
         if !real_path.is_file() {
             return format!("Error: file not found: {file}");
         }
+        if !self.is_visible_path(&real_path, false) {
+            return format!("Error: file not visible: {file}");
+        }
 
         let content = match fs::read(&real_path) {
             Ok(content) => String::from_utf8_lossy(&content).into_owned(),
@@ -350,25 +353,37 @@ impl ToolExecutor {
         let mut entries = match fs::read_dir(real_path) {
             Ok(entries) => entries
                 .flatten()
-                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter_map(|entry| {
+                    let name = entry.file_name().into_string().ok()?;
+                    let path = entry.path();
+                    let is_dir = entry.file_type().map(|file_type| file_type.is_dir()).ok()?;
+                    if !self.is_visible_path(&path, is_dir) {
+                        return None;
+                    }
+                    Some((name, path))
+                })
                 .collect::<Vec<_>>(),
             Err(err) => return format!("Error: {err}"),
         };
-        entries.sort();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
 
         if !all_files {
-            entries.retain(|entry| !entry.starts_with('.'));
+            entries.retain(|(name, _)| !name.starts_with('.'));
         }
 
         if !long_format {
-            return self.truncate_text(&entries.join("\n"), TruncationProfile::General);
+            let names = entries
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            return self.truncate_text(&names, TruncationProfile::General);
         }
 
         let mut lines = vec![format!("total {}", entries.len())];
-        for name in entries {
-            let fp = self.real(&format!("{path}/{name}"));
-            let type_char = if fp.is_dir() { "d" } else { "-" };
-            let size = fp.metadata().map(|meta| meta.len()).unwrap_or(0);
+        for (name, item_path) in entries {
+            let type_char = if item_path.is_dir() { "d" } else { "-" };
+            let size = item_path.metadata().map(|meta| meta.len()).unwrap_or(0);
             lines.push(format!(
                 "{type_char}rwxr-xr-x  1 user  staff {size:>8} Jan 01 00:00 {name}"
             ));
@@ -703,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    fn path_filter_applies_to_tree_glob_and_rg() {
+    fn path_filter_applies_to_all_local_tools() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join(".gitignore"), "ignored/\n*.log\n").unwrap();
         fs::create_dir(tmp.path().join("ignored")).unwrap();
@@ -714,6 +729,8 @@ mod tests {
         fs::write(tmp.path().join("logs").join("drop.log"), "needle").unwrap();
         fs::create_dir(tmp.path().join(".cache")).unwrap();
         fs::write(tmp.path().join(".cache").join("visible.txt"), "needle").unwrap();
+        fs::create_dir(tmp.path().join(".secret")).unwrap();
+        fs::write(tmp.path().join(".secret").join("hidden.txt"), "needle").unwrap();
         fs::write(tmp.path().join("visible.txt"), "needle").unwrap();
 
         let config = PathFilterConfig {
@@ -750,6 +767,56 @@ mod tests {
         assert!(glob.contains("/codebase/.cache/visible.txt"));
         assert!(!glob.contains("/codebase/ignored/skip.txt"));
         assert!(!glob.contains("/codebase/logs/drop.log"));
+
+        let included_readfile = executor.exec_command(&json!({
+            "type": "readfile",
+            "file": "/codebase/ignored/keep.txt"
+        }));
+        assert!(included_readfile.contains("1:needle"));
+
+        assert_eq!(
+            executor.exec_command(&json!({
+                "type": "readfile",
+                "file": "/codebase/ignored/skip.txt"
+            })),
+            "Error: file not visible: /codebase/ignored/skip.txt"
+        );
+        assert_eq!(
+            executor.exec_command(&json!({
+                "type": "readfile",
+                "file": "/codebase/logs/drop.log"
+            })),
+            "Error: file not visible: /codebase/logs/drop.log"
+        );
+        assert_eq!(
+            executor.exec_command(&json!({
+                "type": "readfile",
+                "file": "/codebase/.secret/hidden.txt"
+            })),
+            "Error: file not visible: /codebase/.secret/hidden.txt"
+        );
+
+        let logs = executor.exec_command(&json!({
+            "type": "ls",
+            "path": "/codebase/logs"
+        }));
+        assert!(logs.contains("keep.log"));
+        assert!(!logs.contains("drop.log"));
+
+        let root = executor.exec_command(&json!({
+            "type": "ls",
+            "path": "/codebase"
+        }));
+        assert!(!root.contains(".cache"));
+        assert!(!root.contains(".secret"));
+
+        let root_all = executor.exec_command(&json!({
+            "type": "ls",
+            "path": "/codebase",
+            "all": true
+        }));
+        assert!(root_all.contains(".cache"));
+        assert!(!root_all.contains(".secret"));
 
         if Command::new("rg").arg("--version").output().is_ok() {
             let result = executor.exec_command(&json!({
@@ -814,6 +881,29 @@ mod tests {
             native
                 .exec_command(&json!({"type": "rg", "pattern": "needle", "path": "/codebase"}))
                 .contains("/codebase/visible.txt:1:needle")
+        );
+    }
+
+    #[test]
+    fn disabled_path_filter_allows_readfile_and_ls_entries() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("visible.txt"), "needle").unwrap();
+        let config = PathFilterConfig {
+            enabled: false,
+            exclude_patterns: vec!["visible.txt".to_string()],
+            ..PathFilterConfig::default()
+        };
+        let executor = ToolExecutor::with_limits_and_filter(tmp.path(), None, None, config);
+
+        assert!(
+            executor
+                .exec_command(&json!({"type": "readfile", "file": "/codebase/visible.txt"}))
+                .contains("1:needle")
+        );
+        assert!(
+            executor
+                .exec_command(&json!({"type": "ls", "path": "/codebase"}))
+                .contains("visible.txt")
         );
     }
 

@@ -40,9 +40,11 @@ fn extract_key_show_prints_full_key_and_source() {
 
 #[test]
 fn search_requires_rg() {
+    let tmp = TempDir::new().unwrap();
     let output = Command::cargo_bin("swegrep-cli")
         .unwrap()
-        .args(["search", "dummy_query"])
+        .args(["search", "dummy_query", "--path"])
+        .arg(tmp.path())
         .env("PATH", "")
         .output()
         .unwrap();
@@ -50,4 +52,17 @@ fn search_requires_rg() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("ripgrep"));
+}
+
+#[test]
+fn search_requires_path() {
+    let output = Command::cargo_bin("swegrep-cli")
+        .unwrap()
+        .args(["search", "dummy_query"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--path"));
 }
