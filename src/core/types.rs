@@ -1,5 +1,6 @@
 use crate::path_filter::PathFilterConfig;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,8 +26,29 @@ pub struct SearchResult {
     pub files: Vec<FileEntry>,
     pub rg_patterns: Vec<String>,
     pub raw_response: Option<String>,
-    pub error: Option<String>,
+    pub error: Option<SearchError>,
     pub meta: SearchMeta,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchError {
+    pub code: String,
+    pub message: String,
+}
+
+impl SearchError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for SearchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -7,10 +7,11 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  RIPGREP_VERSION: 15.1.0
 
 jobs:
   package:
@@ -22,14 +23,17 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            ripgrep_target: x86_64-unknown-linux-musl
             artifact: swegrep-cli-linux-x86_64
             archive: swegrep-cli-linux-x86_64.tar.gz
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            ripgrep_target: aarch64-unknown-linux-gnu
             artifact: swegrep-cli-linux-aarch64
             archive: swegrep-cli-linux-aarch64.tar.gz
           - os: windows-2025
             target: x86_64-pc-windows-msvc
+            ripgrep_target: x86_64-pc-windows-msvc
             artifact: swegrep-cli-windows-x86_64
             archive: swegrep-cli-windows-x86_64.zip
 
@@ -59,6 +63,54 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - name: Download ripgrep binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rg_dir="target/ripgrep"
+          extract_dir="$rg_dir/extract"
+          asset="ripgrep-${RIPGREP_VERSION}-${{ matrix.ripgrep_target }}.tar.gz"
+          base_url="https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}"
+          rm -rf "$rg_dir"
+          mkdir -p "$extract_dir"
+          curl -fsSLO "$base_url/$asset"
+          curl -fsSLO "$base_url/$asset.sha256"
+          sha256sum -c "$asset.sha256"
+          tar -xzf "$asset" -C "$extract_dir"
+          rg_path="$(find "$extract_dir" -type f -name rg -print -quit)"
+          test -n "$rg_path"
+          cp "$rg_path" "$rg_dir/rg"
+          chmod +x "$rg_dir/rg"
+
+      - name: Download ripgrep binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $rgDir = "target\ripgrep"
+          $extractDir = "$rgDir\extract"
+          $asset = "ripgrep-${env:RIPGREP_VERSION}-${{ matrix.ripgrep_target }}.zip"
+          $baseUrl = "https://github.com/BurntSushi/ripgrep/releases/download/${env:RIPGREP_VERSION}"
+          Remove-Item -Recurse -Force $rgDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $extractDir | Out-Null
+          Invoke-WebRequest "$baseUrl/$asset" -OutFile $asset
+          Invoke-WebRequest "$baseUrl/$asset.sha256" -OutFile "$asset.sha256"
+          $digestMatch = [regex]::Match((Get-Content "$asset.sha256" -Raw), '[a-fA-F0-9]{64}')
+          if (-not $digestMatch.Success) {
+            throw "Could not find SHA256 digest in $asset.sha256"
+          }
+          $expected = $digestMatch.Value.ToLowerInvariant()
+          $actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "Checksum mismatch for $asset"
+          }
+          Expand-Archive -Path $asset -DestinationPath $extractDir -Force
+          $rg = Get-ChildItem -Path $extractDir -Recurse -Filter rg.exe | Select-Object -First 1
+          if (-not $rg) {
+            throw "rg.exe not found in $asset"
+          }
+          Copy-Item $rg.FullName "$rgDir\rg.exe"
+
       - name: Smoke test
         if: runner.os != 'Windows'
         run: ./target/${{ matrix.target }}/release/swegrep-cli --help
@@ -73,12 +125,17 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf dist
-          staging="dist/${{ matrix.artifact }}"
-          mkdir -p "$staging"
-          cp "target/${{ matrix.target }}/release/swegrep-cli" "$staging/"
-          cp README.md "$staging/"
-          cp LICENSE "$staging/"
-          tar -czf "dist/${{ matrix.archive }}" -C dist "${{ matrix.artifact }}"
+          staging="dist/swe-grep"
+          mkdir -p "$staging/bin"
+          cp "target/${{ matrix.target }}/release/swegrep-cli" "$staging/bin/"
+          cp "target/ripgrep/rg" "$staging/bin/"
+          cp SKILL.md "$staging/"
+          "$staging/bin/rg" --version
+          env PATH="" "$staging/bin/swegrep-cli" search dummy_query --path "$staging/missing-project" 2> "$staging/smoke.stderr" && exit 1
+          grep -q "Project path does not exist" "$staging/smoke.stderr"
+          ! grep -q "ripgrep" "$staging/smoke.stderr"
+          rm "$staging/smoke.stderr"
+          tar -czf "dist/${{ matrix.archive }}" -C dist swe-grep
           cd dist
           sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
 
@@ -87,11 +144,35 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
-          $staging = "dist\${{ matrix.artifact }}"
-          New-Item -ItemType Directory -Force $staging | Out-Null
-          Copy-Item "target\${{ matrix.target }}\release\swegrep-cli.exe" $staging
-          Copy-Item README.md $staging
-          Copy-Item LICENSE $staging
+          $staging = "dist\swe-grep"
+          New-Item -ItemType Directory -Force "$staging\bin" | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\swegrep-cli.exe" "$staging\bin"
+          Copy-Item "target\ripgrep\rg.exe" "$staging\bin"
+          Copy-Item SKILL.md $staging
+          & "$staging\bin\rg.exe" --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Bundled rg --version failed with exit code $LASTEXITCODE"
+          }
+          $originalPath = $env:PATH
+          $env:PATH = ""
+          try {
+            & "$staging\bin\swegrep-cli.exe" search dummy_query --path "$staging\missing-project" 2> "$staging\smoke.stderr"
+            $smokeExitCode = $LASTEXITCODE
+            if ($smokeExitCode -eq 0) {
+              throw "Expected smoke test search to fail on missing project path"
+            }
+          } finally {
+            $env:PATH = $originalPath
+          }
+          $smokeStderr = Get-Content "$staging\smoke.stderr" -Raw
+          if (-not $smokeStderr.Contains("Project path does not exist")) {
+            throw "Smoke test did not reach project path validation"
+          }
+          if ($smokeStderr.Contains("ripgrep")) {
+            throw "Smoke test failed to resolve bundled rg"
+          }
+          $global:LASTEXITCODE = 0
+          Remove-Item "$staging\smoke.stderr"
           Compress-Archive -Path $staging -DestinationPath "dist\${{ matrix.archive }}" -Force
           Push-Location dist
           $hash = (Get-FileHash "${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower()
@@ -113,6 +194,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     needs: package
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4

@@ -1,30 +1,17 @@
-use crate::credentials;
 use crate::protobuf::{ProtobufEncoder, extract_strings};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::credentials;
 use super::http::unary_request;
 use super::{
     AUTH_BASE, AuthCheck, DEFAULT_WS_APP_VER, DEFAULT_WS_LS_VER, FastContextError, WS_APP,
 };
-
-pub fn get_config_path() -> PathBuf {
-    credentials::get_config_path()
-}
-
-pub fn load_cached_api_key() -> Option<String> {
-    credentials::load_cached_api_key(Some(&get_config_path()))
-}
-
-pub fn save_cached_api_key(key: &str) -> Result<PathBuf, String> {
-    credentials::save_cached_api_key(key, Some(&get_config_path()))
-}
 
 pub fn get_api_key(api_key: Option<&str>, save_discovered: bool) -> Result<String, String> {
     if let Some(api_key) = api_key {
@@ -52,21 +39,24 @@ pub fn get_api_key(api_key: Option<&str>, save_discovered: bool) -> Result<Strin
         return Ok(key);
     }
 
-    if let Some(cached) = load_cached_api_key() {
+    if let Some(cached) = credentials::load_cached_api_key(Some(&credentials::get_config_path())) {
         eprintln!("[swegrep-cli] Using cached API key from config");
         return Ok(cached);
     }
 
     if let Some(discovered) = credentials::discover_api_key(None) {
         if save_discovered {
-            let _ = save_cached_api_key(&discovered);
+            let _ = credentials::save_cached_api_key(
+                &discovered,
+                Some(&credentials::get_config_path()),
+            );
         }
         return Ok(discovered);
     }
 
     Err(format!(
         "Windsurf API Key not found. Set WINDSURF_API_KEY env var, ensure Windsurf is logged in, or write it to config file: {}",
-        get_config_path().display()
+        credentials::get_config_path().display()
     ))
 }
 

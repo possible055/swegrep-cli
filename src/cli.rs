@@ -1,8 +1,10 @@
-use crate::core::{SearchOptions, search};
-use crate::credentials::{self, extract_key, mask_api_key, save_cached_api_key};
+use crate::core::{
+    self, SearchOptions, extract_key, format_search_success, mask_api_key, save_cached_api_key,
+    search,
+};
 use crate::path_filter::PathFilterConfig;
+use crate::rg::resolve_rg_path;
 use clap::{Args, Parser, Subcommand};
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::ErrorKind;
@@ -72,11 +74,6 @@ pub fn run() -> i32 {
     let timeout_ms = read_timeout_ms_env();
 
     let cli = Cli::parse();
-    if !command_exists("rg") {
-        eprintln!("Error: ripgrep ('rg') is required but was not found in PATH.");
-        return 1;
-    }
-
     match cli.command {
         Commands::ExtractKey(args) => run_extract_key(args),
         Commands::Search(args) => run_search(
@@ -90,7 +87,7 @@ pub fn run() -> i32 {
 }
 
 pub fn load_skill_env() {
-    let env_path = credentials::get_config_path()
+    let env_path = core::get_config_path()
         .parent()
         .map(Path::to_path_buf)
         .map(|dir| dir.join(".env"));
@@ -243,6 +240,11 @@ fn run_search(
     max_commands: usize,
     timeout_ms: u64,
 ) -> i32 {
+    if let Err(error) = resolve_rg_path() {
+        eprintln!("{error}");
+        return 1;
+    }
+
     let project_path = absolute_path(&args.path);
     if !project_path.is_dir() {
         eprintln!(
@@ -283,49 +285,8 @@ fn run_search(
         return 1;
     }
 
-    if result.files.is_empty() {
-        println!(
-            "{}",
-            format_no_relevant_files(result.raw_response.as_deref())
-        );
-        return 0;
-    }
-
-    println!("\nFound {} relevant files:\n", result.files.len());
-    for (idx, entry) in result.files.iter().enumerate() {
-        let ranges = entry
-            .ranges
-            .iter()
-            .map(|(start, end)| format!("L{start}-{end}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!(
-            "  [{}/{}] {} ({ranges})",
-            idx + 1,
-            result.files.len(),
-            entry.full_path
-        );
-    }
-
-    let mut seen = HashSet::new();
-    let patterns = result
-        .rg_patterns
-        .into_iter()
-        .filter(|pattern| pattern.len() >= 3)
-        .filter(|pattern| seen.insert(pattern.clone()))
-        .collect::<Vec<_>>();
-    if !patterns.is_empty() {
-        println!("\ngrep keywords: {}", patterns.join(", "));
-    }
-
+    println!("{}", format_search_success(&result));
     0
-}
-
-fn format_no_relevant_files(raw_response: Option<&str>) -> String {
-    match raw_response {
-        Some(raw_response) => format!("No relevant files found.\n\nRaw response:\n{raw_response}"),
-        None => "No relevant files found.".to_string(),
-    }
 }
 
 fn read_path_filter_config() -> PathFilterConfig {
@@ -334,10 +295,7 @@ fn read_path_filter_config() -> PathFilterConfig {
         return PathFilterConfig::disabled();
     }
 
-    let Some(config_dir) = credentials::get_config_path()
-        .parent()
-        .map(Path::to_path_buf)
-    else {
+    let Some(config_dir) = core::get_config_path().parent().map(Path::to_path_buf) else {
         return PathFilterConfig::default();
     };
 
@@ -396,38 +354,6 @@ fn absolute_path(path: &Path) -> PathBuf {
     candidate.canonicalize().unwrap_or(candidate)
 }
 
-fn command_exists(command: &str) -> bool {
-    let Some(paths) = env::var_os("PATH") else {
-        return false;
-    };
-
-    for dir in env::split_paths(&paths) {
-        let candidate = dir.join(command);
-        if candidate.is_file() {
-            return true;
-        }
-        if cfg!(target_os = "windows") {
-            let extensions = env::var_os("PATHEXT")
-                .map(|value| {
-                    value
-                        .to_string_lossy()
-                        .split(';')
-                        .map(ToOwned::to_owned)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_else(|| {
-                    vec![".exe".to_string(), ".bat".to_string(), ".cmd".to_string()]
-                });
-            for ext in extensions {
-                if dir.join(format!("{command}{ext}")).is_file() {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,14 +400,6 @@ mod tests {
         assert_eq!(
             parse_env_u64_range_value("not-a-number", 1_000..=300_000),
             None
-        );
-    }
-
-    #[test]
-    fn no_relevant_files_output_includes_raw_response_when_present() {
-        assert_eq!(
-            format_no_relevant_files(Some("model text")),
-            "No relevant files found.\n\nRaw response:\nmodel text"
         );
     }
 }

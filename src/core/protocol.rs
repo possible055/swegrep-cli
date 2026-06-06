@@ -8,7 +8,7 @@ use super::auth::{ws_app_version, ws_ls_version};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChatMessage {
-    pub(super) role: u64,
+    pub(super) role: MessageRole,
     pub(super) content: String,
     pub(super) tool_call_id: Option<String>,
     pub(super) tool_name: Option<String>,
@@ -16,8 +16,27 @@ pub(crate) struct ChatMessage {
     pub(super) ref_call_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageRole {
+    User,
+    Assistant,
+    Tool,
+    System,
+}
+
+impl MessageRole {
+    fn wire_value(self) -> u64 {
+        match self {
+            Self::User => 1,
+            Self::Assistant => 2,
+            Self::Tool => 4,
+            Self::System => 5,
+        }
+    }
+}
+
 impl ChatMessage {
-    pub(crate) fn simple(role: u64, content: impl Into<String>) -> Self {
+    pub(crate) fn simple(role: MessageRole, content: impl Into<String>) -> Self {
         Self {
             role,
             content: content.into(),
@@ -104,10 +123,10 @@ fn build_metadata(
     meta
 }
 
-fn build_chat_message(role: u64, content: &str, message: &ChatMessage) -> ProtobufEncoder {
+fn build_chat_message(message: &ChatMessage) -> ProtobufEncoder {
     let mut msg = ProtobufEncoder::new();
-    msg.write_varint(2, role);
-    msg.write_string(3, content);
+    msg.write_varint(2, message.role.wire_value());
+    msg.write_string(3, &message.content);
 
     if let (Some(tool_call_id), Some(tool_name), Some(tool_args_json)) = (
         message.tool_call_id.as_ref(),
@@ -140,7 +159,7 @@ pub(crate) fn build_request(
     req.write_message(1, &build_metadata(api_key, jwt, app_version, ls_version));
 
     for message in messages {
-        let msg = build_chat_message(message.role, &message.content, message);
+        let msg = build_chat_message(message);
         req.write_message(2, &msg);
     }
 
@@ -496,7 +515,7 @@ pub(crate) fn trim_messages(messages: &mut Vec<ChatMessage>) -> bool {
     messages.clear();
     messages.extend(head);
     messages.push(ChatMessage::simple(
-        1,
+        MessageRole::User,
         "[Prior search rounds omitted to reduce payload. Provide your best answer based on available context.]",
     ));
     messages.extend(tail);
@@ -511,12 +530,12 @@ mod tests {
     #[test]
     fn trim_messages_keeps_head_bridge_and_tail() {
         let mut messages = vec![
-            ChatMessage::simple(5, "system"),
-            ChatMessage::simple(1, "user"),
-            ChatMessage::simple(2, "thinking 1"),
-            ChatMessage::simple(4, "result 1"),
-            ChatMessage::simple(2, "thinking 2"),
-            ChatMessage::simple(4, "result 2"),
+            ChatMessage::simple(MessageRole::System, "system"),
+            ChatMessage::simple(MessageRole::User, "user"),
+            ChatMessage::simple(MessageRole::Assistant, "thinking 1"),
+            ChatMessage::simple(MessageRole::Tool, "result 1"),
+            ChatMessage::simple(MessageRole::Assistant, "thinking 2"),
+            ChatMessage::simple(MessageRole::Tool, "result 2"),
         ];
 
         assert!(trim_messages(&mut messages));
@@ -526,6 +545,14 @@ mod tests {
         assert!(messages[2].content.contains("omitted"));
         assert_eq!(messages[3].content, "thinking 2");
         assert_eq!(messages[4].content, "result 2");
+    }
+
+    #[test]
+    fn message_role_wire_values_match_existing_protocol_numbers() {
+        assert_eq!(MessageRole::User.wire_value(), 1);
+        assert_eq!(MessageRole::Assistant.wire_value(), 2);
+        assert_eq!(MessageRole::Tool.wire_value(), 4);
+        assert_eq!(MessageRole::System.wire_value(), 5);
     }
 
     #[test]

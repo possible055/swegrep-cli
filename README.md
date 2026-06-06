@@ -1,5 +1,7 @@
 # swegrep-cli
 
+English | [简体中文](README_zh.md)
+
 `swegrep-cli` is a Rust CLI for Windsurf Context subagent-compatible code search. It sends a natural-language query to `GetDevstralStream`, executes `restricted_exec` local search commands against your working tree, and returns the most relevant files and line ranges.
 
 ## Scope
@@ -7,12 +9,9 @@
 - Implements a Windsurf Context subagent-compatible `restricted_exec` fast-context loop.
 - Executes local equivalents of the official fast-context subcommands: `rg`, `readfile`, `tree`, `ls`, and `glob`.
 - Returns compact file/range results for follow-up inspection.
-- Does not aim to be a full Windsurf Cascade or ACP runtime clone.
 
 ## Requirements
 
-- Rust `1.96.0` or newer
-- `ripgrep` (`rg`) available in `PATH`
 - A logged-in Windsurf installation or a valid Windsurf API key
 
 ## Build
@@ -28,20 +27,6 @@ cargo build --release
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
-```
-
-## Release Binaries
-
-Pushing a `v*` tag runs the release workflow and publishes GitHub Release
-assets for:
-
-- Linux x86_64
-- Linux ARM64
-- Windows x86_64
-
-```bash
-git tag v0.1.1
-git push origin main v0.1.1
 ```
 
 ## Usage
@@ -117,7 +102,7 @@ Additional rules:
 
 Global filter files:
 
-| File | macOS / Linux | Windows |
+| File | Linux | Windows |
 | --- | --- | --- |
 | `include.txt` | `~/.config/swegrep/include.txt` | `~/.swegrep/include.txt` |
 | `exclude.txt` | `~/.config/swegrep/exclude.txt` | `~/.swegrep/exclude.txt` |
@@ -140,6 +125,7 @@ Supported variables:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `WINDSURF_API_KEY` | none | Windsurf API key used by `search` |
+| `SWEGREP_RG_PATH` | none | Custom `rg` binary path; overrides bundled `rg` and `PATH` |
 | `WS_APP_VER` | `1.48.2` | Windsurf app version metadata |
 | `WS_LS_VER` | `1.9544.35` | Windsurf language server version metadata |
 | `SWEGREP_PATH_FILTER` | `1` | Enable shared path filtering; use `0`, `false`, `no`, or `off` to disable |
@@ -150,7 +136,9 @@ Supported variables:
 | `FC_MAX_TURNS` | `3` | Default maximum search rounds for `search` |
 | `FC_TIMEOUT_MS` | `30000` | Streaming timeout in milliseconds |
 
-## Limitations
+## Acknowledgements
 
-- Search quality, availability, and rate limits depend on Windsurf account access and server behavior.
-- Some environments expose credentials as `devin-session-token$...`; pass the full string when using that format.
+This project was inspired by and built upon ideas from the following projects:
+
+- [fast-context-mcp](https://github.com/SammySnake-d/fast-context-mcp)
+- [fast-context-skill](https://github.com/oulkurt/fast-context-skill)

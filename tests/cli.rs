@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use rusqlite::{Connection, params};
 use serde_json::json;
+use std::fs;
 use tempfile::TempDir;
 
 fn write_auth_db(path: &std::path::Path, key: &str) {
@@ -52,6 +53,30 @@ fn search_requires_rg() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("ripgrep"));
+}
+
+#[test]
+fn search_accepts_bundled_rg_when_path_is_empty() {
+    let tmp = TempDir::new().unwrap();
+    let binary_name = format!("swegrep-cli{}", std::env::consts::EXE_SUFFIX);
+    let bundled_rg_name = format!("rg{}", std::env::consts::EXE_SUFFIX);
+    let bundled_bin = tmp.path().join(binary_name);
+    let bundled_rg = tmp.path().join(bundled_rg_name);
+    fs::copy(assert_cmd::cargo::cargo_bin("swegrep-cli"), &bundled_bin).unwrap();
+    fs::write(&bundled_rg, "").unwrap();
+
+    let missing_project = tmp.path().join("missing-project");
+    let output = std::process::Command::new(&bundled_bin)
+        .args(["search", "dummy_query", "--path"])
+        .arg(&missing_project)
+        .env("PATH", "")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Project path does not exist"));
+    assert!(!stderr.contains("ripgrep"));
 }
 
 #[test]

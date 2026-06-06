@@ -5,6 +5,7 @@ use super::{
     InstantContextTiming, InstantContextToolCall, InstantContextToolUpdate, ToolExecutionStatus,
     ToolExecutor, TruncationProfile,
 };
+use crate::rg::{resolve_rg_path, ripgrep_not_found_message};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
@@ -81,7 +82,12 @@ impl ToolExecutor {
                     .collect::<Vec<_>>(),
             );
 
-            match Command::new("rg").args(args).output() {
+            let rg_path = match resolve_rg_path() {
+                Ok(path) => path,
+                Err(error) => return error.to_string(),
+            };
+
+            match Command::new(rg_path).args(args).output() {
                 Ok(output) => {
                     let code = output.status.code().unwrap_or(-1);
                     if code == 1 {
@@ -100,7 +106,7 @@ impl ToolExecutor {
                     return format!("Error: exit status {code}");
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return "Error: ripgrep ('rg') is not installed or not in PATH.".to_string();
+                    return ripgrep_not_found_message().to_string();
                 }
                 Err(err) => return format!("Error: {err}"),
             }
@@ -144,7 +150,12 @@ impl ToolExecutor {
         args.push(pattern.to_string());
         args.push(real_path.to_string_lossy().into_owned());
 
-        match Command::new("rg").args(args).output() {
+        let rg_path = match resolve_rg_path() {
+            Ok(path) => path,
+            Err(error) => return error.to_string(),
+        };
+
+        match Command::new(rg_path).args(args).output() {
             Ok(output) => {
                 let code = output.status.code().unwrap_or(-1);
                 if code == 1 {
@@ -163,7 +174,7 @@ impl ToolExecutor {
                 format!("Error: exit status {code}")
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                "Error: ripgrep ('rg') is not installed or not in PATH.".to_string()
+                ripgrep_not_found_message().to_string()
             }
             Err(err) => format!("Error: {err}"),
         }
@@ -614,10 +625,18 @@ fn string_array(value: Option<&Value>) -> Option<Vec<String>> {
 mod tests {
     use crate::executor::{InstantContextToolCall, ToolExecutionStatus, ToolExecutor};
     use crate::path_filter::PathFilterConfig;
+    use crate::rg::resolve_rg_path;
     use serde_json::json;
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+
+    fn rg_available() -> bool {
+        let Ok(path) = resolve_rg_path() else {
+            return false;
+        };
+        Command::new(path).arg("--version").output().is_ok()
+    }
 
     #[test]
     fn exec_command_readfile_supports_full_file_and_ranges() {
@@ -818,7 +837,7 @@ mod tests {
         assert!(root_all.contains(".cache"));
         assert!(!root_all.contains(".secret"));
 
-        if Command::new("rg").arg("--version").output().is_ok() {
+        if rg_available() {
             let result = executor.exec_command(&json!({
                 "type": "rg",
                 "pattern": "needle",
@@ -835,7 +854,7 @@ mod tests {
 
     #[test]
     fn exec_command_rg_includes_filename_for_single_file_results() {
-        if Command::new("rg").arg("--version").output().is_err() {
+        if !rg_available() {
             return;
         }
 
@@ -854,7 +873,7 @@ mod tests {
 
     #[test]
     fn disabled_path_filter_uses_native_rg_traversal() {
-        if Command::new("rg").arg("--version").output().is_err() {
+        if !rg_available() {
             return;
         }
 
@@ -920,7 +939,7 @@ mod tests {
                 .exec_command(&json!({"type": "readfile", "file": "/codebase/test.txt"}))
                 .contains("1:hello world")
         );
-        if Command::new("rg").arg("--version").output().is_ok() {
+        if rg_available() {
             assert!(
                 executor
                     .exec_command(&json!({"type": "rg", "pattern": "hello", "path": "/codebase"}))

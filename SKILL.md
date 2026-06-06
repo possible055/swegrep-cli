@@ -1,78 +1,49 @@
-# swegrep-cli Skill Configuration Guide
-
-This Rust CLI is designed to be packaged and executed as an agentic AI skill. Build it with `cargo build --release`, then expose `target/release/swegrep-cli` to the caller. To customize behavior when called by tools or systems, place environment and path filtering configuration files inside the native `swegrep` configuration directory.
-
-## Configuration Paths
-
-Depending on your platform, config files are read from:
-
-- **Linux / macOS / WSL**: `~/.config/swegrep/`
-- **Windows**: `~/.swegrep/`
-
+---
+name: swe-grep
+description: Use swegrep-cli for semantic codebase search in local repositories. Best for broad natural-language questions about implementation paths, feature flow, and relevant files. Use ripgrep for exact keyword lookup.
+metadata:
+  short-description: Semantic codebase search with swegrep-cli
 ---
 
-## 1. Environment Variables Configuration (`.env`)
+# SWE Grep
 
-Before using the tool as a skill, create an environment configuration file:
+## When To Use
 
-### Path
-- Unix-like: `~/.config/swegrep/.env`
-- Windows: `~/.swegrep/.env`
+Use this skill when the user asks a codebase question that benefits from semantic or natural-language search, such as:
+- Where a behavior, API, feature, command, or configuration is implemented.
+- Which files are most relevant before making a change.
+- How an authentication, request, parsing, execution, or persistence flow is wired.
+- Where to continue investigation when exact identifiers are unknown.
 
-### Example Content
-```ini
-# Windsurf API Key or Devin session token
-API_KEY=devin-session-token$eyJhbGciOiJIUzI1...
+## Binary
 
-# Streaming connection timeout in seconds (default is 30)
-TIMEOUT=120
+The packaged executable is located next to this skill file under:
+- Linux: `./bin/swegrep-cli`
+- Windows: `.\bin\swegrep-cli.exe`
 
-# Directory tree depth limit for initial repo map (3-6, default is 4)
-DEPTH=4
+## Command
 
-# Maximum search execution rounds/turns (3-5, default is 3)
-TURNS=3
+### Codebase Search
+
+Run codebase search from the target repository root:
+```sh
+./bin/swegrep-cli search "<natural language query>" --path <repo-path> --turns 3
 ```
 
----
+**Parameters:**
+* `<natural language query>`: A broad semantic question about the codebase.
+* `--path`: Target repository root to search. Use an absolute path when possible.
+* `--turns <3-5>`: Maximum search rounds. Use `3` by default for normal questions. Increase to `4` or `5` only when the task is broad, ambiguous, or likely to require deeper codebase traversal.
 
-## 2. Global Path Filtering
+### Extract Key
 
-The project root `.gitignore` is read by default. Global swegrep filters can override it for the repo map and local `tree`, `rg`, and `glob` tools.
+When credentials are missing, try extracting and saving them:
 
-Priority:
-
-```text
-exclude.txt > include.txt > .gitignore
+```sh
+./bin/swegrep-cli extract-key --save
 ```
 
-### Include Path
-- Unix-like: `~/.config/swegrep/include.txt`
-- Windows: `~/.swegrep/include.txt`
-
-### Exclude Path
-- Unix-like: `~/.config/swegrep/exclude.txt`
-- Windows: `~/.swegrep/exclude.txt`
-
-### Example `include.txt`
-```text
-# Re-include specific ignored files or directories
-target/generated-schema.json
-.config/visible.txt
-```
-
-### Example `exclude.txt`
-```text
-# Exclude build directories and cache
-dist
-build
-target
-
-# Exclude packages
-node_modules
-.git
-```
-
-Each non-empty line that does not start with `#` is parsed as a gitignore-like pattern.
-
-`rg` uses this shared filter by default. Set `SWEGREP_PATH_FILTER=0` in `.env` to disable the global filtering policy and let `rg` traverse paths natively when comparing behavior or diagnosing filter issues.
+**Parameters:**
+* `--save`: Save the extracted key to the swegrep config.
+* `--show`: Print the full key instead of a masked key.
+* `--db-path <path>`: Read a specific Windsurf `state.vscdb` file instead of auto-detecting it.

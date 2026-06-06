@@ -10,11 +10,12 @@ use super::auth::{get_api_key, get_cached_jwt};
 use super::error::FastContextError;
 use super::http;
 use super::protocol::{
-    ChatMessage, FINAL_FORCE_ANSWER, ParsedModelTurn, build_request, build_system_prompt,
-    get_tool_definitions, parse_response, trim_messages,
+    ChatMessage, FINAL_FORCE_ANSWER, MessageRole, ParsedModelTurn, build_request,
+    build_system_prompt, get_tool_definitions, parse_response, trim_messages,
 };
 use super::repo::{RepoMap, get_repo_map, parse_answer};
-use super::types::{SearchMeta, SearchOptions, SearchResult};
+use super::types::{SearchError, SearchMeta, SearchOptions, SearchResult};
+use super::{SearchOutputConfig, format_search_error, format_search_success};
 
 #[derive(Debug, Clone, PartialEq)]
 struct InstantContextStep {
@@ -68,7 +69,7 @@ where
         Ok(api_key) => api_key,
         Err(err) => {
             return SearchResult {
-                error: Some(err),
+                error: Some(SearchError::new("API_KEY_ERROR", err)),
                 meta: SearchMeta {
                     project_root: Some(project_root.to_string_lossy().into_owned()),
                     error_code: Some("API_KEY_ERROR".to_string()),
@@ -87,7 +88,7 @@ where
             Ok(jwt) => jwt,
             Err(err) => {
                 return SearchResult {
-                    error: Some(format!("{}: {}", err.code, err.message)),
+                    error: Some(SearchError::new(err.code.clone(), err.message)),
                     meta: SearchMeta {
                         project_root: Some(project_root.to_string_lossy().into_owned()),
                         error_code: Some(err.code),
@@ -127,8 +128,8 @@ where
     let user_content = build_user_content(&options.query, &repo_map);
 
     let mut messages = vec![
-        ChatMessage::simple(5, system_prompt),
-        ChatMessage::simple(1, user_content),
+        ChatMessage::simple(MessageRole::System, system_prompt),
+        ChatMessage::simple(MessageRole::User, user_content),
     ];
 
     let total_api_calls = options.max_turns + 1;
@@ -176,9 +177,9 @@ where
                         Err(retry_err) => {
                             return SearchResult {
                                 files: Vec::new(),
-                                error: Some(format!(
-                                    "{}: {} (retry failure)",
-                                    retry_err.code, retry_err.message
+                                error: Some(SearchError::new(
+                                    retry_err.code.clone(),
+                                    format!("{} (retry failure)", retry_err.message),
                                 )),
                                 meta: SearchMeta {
                                     error_code: Some(retry_err.code),
@@ -192,7 +193,7 @@ where
                 } else {
                     return SearchResult {
                         files: Vec::new(),
-                        error: Some(format!("{}: {}", err.code, err.message)),
+                        error: Some(SearchError::new(err.code, err.message)),
                         meta: base_meta,
                         ..SearchResult::default()
                     };
@@ -217,7 +218,7 @@ where
                 Err(err) => {
                     return SearchResult {
                         files: Vec::new(),
-                        error: Some(format!("{}: {}", err.code, err.message)),
+                        error: Some(SearchError::new(err.code.clone(), err.message)),
                         meta: search_meta(&project_root, &repo_map, Some(err.code)),
                         ..SearchResult::default()
                     };
@@ -227,8 +228,15 @@ where
             if matches!(&parsed, ParsedModelTurn::Text(text) if text.trim().is_empty()) {
                 return SearchResult {
                     files: Vec::new(),
-                    error: Some("Model returned empty response".to_string()),
-                    meta: search_meta(&project_root, &repo_map, None),
+                    error: Some(SearchError::new(
+                        "MODEL_EMPTY_RESPONSE",
+                        "Model returned empty response",
+                    )),
+                    meta: search_meta(
+                        &project_root,
+                        &repo_map,
+                        Some("MODEL_EMPTY_RESPONSE".to_string()),
+                    ),
                     ..SearchResult::default()
                 };
             }
@@ -239,7 +247,8 @@ where
             ParsedModelTurn::Error(error) => {
                 return SearchResult {
                     files: Vec::new(),
-                    error: Some(error),
+                    error: Some(SearchError::new("MODEL_ERROR", error)),
+                    meta: search_meta(&project_root, &repo_map, Some("MODEL_ERROR".to_string())),
                     ..SearchResult::default()
                 };
             }
@@ -341,7 +350,7 @@ where
         let results = format_restricted_exec_results(&updates);
 
         messages.push(ChatMessage {
-            role: 2,
+            role: MessageRole::Assistant,
             content: thinking,
             tool_call_id: Some(tool_ref_id.clone()),
             tool_name: Some(assistant_tool_name),
@@ -349,7 +358,7 @@ where
             ref_call_id: None,
         });
         messages.push(ChatMessage {
-            role: 4,
+            role: MessageRole::Tool,
             content: results,
             tool_call_id: None,
             tool_name: None,
@@ -362,11 +371,11 @@ where
             .min(options.max_turns);
         if effective_turns_used < options.max_turns {
             messages.push(ChatMessage::simple(
-                1,
+                MessageRole::User,
                 format_search_turn_status(effective_turns_used, options.max_turns),
             ));
         } else if !force_answer_injected {
-            messages.push(ChatMessage::simple(1, FINAL_FORCE_ANSWER));
+            messages.push(ChatMessage::simple(MessageRole::User, FINAL_FORCE_ANSWER));
             force_answer_injected = true;
             log("Injected force-answer prompt");
         }
@@ -377,8 +386,15 @@ where
     SearchResult {
         files: Vec::new(),
         rg_patterns: unique_patterns(executor.collected_rg_patterns()),
-        error: Some("Max turns reached without getting an answer".to_string()),
-        meta: search_meta(&project_root, &repo_map, None),
+        error: Some(SearchError::new(
+            "MAX_TURNS_REACHED",
+            "Max turns reached without getting an answer",
+        )),
+        meta: search_meta(
+            &project_root,
+            &repo_map,
+            Some("MAX_TURNS_REACHED".to_string()),
+        ),
         ..SearchResult::default()
     }
 }
@@ -491,100 +507,29 @@ fn format_restricted_exec_results(updates: &[InstantContextToolUpdate]) -> Strin
 pub async fn search_with_content(options: SearchOptions) -> String {
     let max_turns = options.max_turns;
     let max_results = options.max_results;
+    let max_commands = options.max_commands;
     let result = search(options.clone(), None).await;
 
-    if let Some(error) = result.error {
-        let mut err_msg = format!("Error: {error}");
-        if result.meta.tree_depth.is_some() || result.meta.error_code.is_some() {
-            err_msg.push_str(&format!(
-                "\n\n[diagnostic] error_type={}, tree_depth_used={:?}, tree_size={:?}KB",
-                result.meta.error_code.as_deref().unwrap_or("unknown"),
-                result.meta.tree_depth,
-                result.meta.tree_size_kb
-            ));
-            if result.meta.fell_back == Some(true) {
-                err_msg.push_str(" (auto fell back)");
-            }
-            if result.meta.context_trimmed == Some(true) {
-                err_msg.push_str(", context_trimmed=true");
-            }
-            if let Some(project_root) = result.meta.project_root {
-                err_msg.push_str(&format!("\n[diagnostic] project_path={project_root}"));
-            }
-            err_msg.push_str(&format!(
-                "\n[config] max_turns={max_turns}, max_results={max_results}, max_commands={}",
-                options.max_commands
-            ));
-
-            match result.meta.error_code.as_deref() {
-                Some("PAYLOAD_TOO_LARGE" | "TIMEOUT") => {
-                    err_msg.push_str(
-                        "\n[hint] Try: reduce scope snapshot depth, add exclude.txt entries, or narrow project_path.",
-                    );
-                }
-                Some("AUTH_ERROR") => {
-                    err_msg.push_str(
-                        "\n[hint] Authentication error. Ensure a fresh WINDSURF_API_KEY is configured.",
-                    );
-                }
-                Some("RATE_LIMITED") => {
-                    err_msg.push_str("\n[hint] Rate limited. Wait a moment and retry.");
-                }
-                _ => {}
-            }
-        }
-        return err_msg;
+    if result.error.is_some() {
+        return format_search_error(
+            &result,
+            Some(SearchOutputConfig {
+                max_turns,
+                max_results,
+                max_commands,
+            }),
+        );
     }
 
-    let unique_patterns = result
-        .rg_patterns
-        .iter()
-        .filter(|pattern| pattern.len() >= 3)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if result.files.is_empty() && unique_patterns.is_empty() {
-        return result
-            .raw_response
-            .map(|raw| format!("No relevant files found.\n\nRaw response:\n{raw}"))
-            .unwrap_or_else(|| "No relevant files found.".to_string());
-    }
-
-    let mut parts = Vec::new();
-    if result.files.is_empty() {
-        parts.push("No files found.".to_string());
-    } else {
-        parts.push(format!("Found {} relevant files.\n", result.files.len()));
-        for (idx, entry) in result.files.iter().enumerate() {
-            let ranges = entry
-                .ranges
-                .iter()
-                .map(|(start, end)| format!("L{start}-{end}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            parts.push(format!(
-                "  [{}/{}] {} ({ranges})",
-                idx + 1,
-                result.files.len(),
-                entry.full_path
-            ));
-        }
-    }
-
-    if !unique_patterns.is_empty() {
-        parts.push(String::new());
-        parts.push(format!("grep keywords: {}", unique_patterns.join(", ")));
-    }
-
+    let mut output = format_search_success(&result);
     if result.meta.tree_depth.is_some() {
-        parts.push(String::new());
         let fb_note = if result.meta.fell_back == Some(true) {
             " (fell back)"
         } else {
             ""
         };
-        parts.push(format!(
-            "[config] tree_depth={}{}{}, tree_size={}KB, max_turns={max_turns}, max_results={max_results}",
+        output.push_str(&format!(
+            "\n\n[config] tree_depth={}{}{}, tree_size={}KB, max_turns={max_turns}, max_results={max_results}",
             result.meta.tree_depth.unwrap_or_default(),
             fb_note,
             "",
@@ -592,7 +537,7 @@ pub async fn search_with_content(options: SearchOptions) -> String {
         ));
     }
 
-    parts.join("\n")
+    output
 }
 
 #[cfg(test)]
@@ -1069,10 +1014,9 @@ mod tests {
         })
         .await;
 
-        assert_eq!(
-            result.error.as_deref(),
-            Some("Model returned empty response")
-        );
+        let error = result.error.as_ref().unwrap();
+        assert_eq!(error.code, "MODEL_EMPTY_RESPONSE");
+        assert_eq!(error.message, "Model returned empty response");
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 
