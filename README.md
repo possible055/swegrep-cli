@@ -92,7 +92,7 @@ By default, visibility is determined in this order:
 
 1. `exclude.txt`
 2. `include.txt`
-3. Project-root `.gitignore`
+3. `.gitignore` files from the project root through nested subdirectories
 
 Additional rules:
 

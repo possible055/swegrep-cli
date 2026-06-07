@@ -92,7 +92,7 @@ swegrep-cli extract-key --db-path /path/to/state.vscdb
 
 1. `exclude.txt`
 2. `include.txt`
-3. 项目根目录的 `.gitignore`
+3. 从项目根目录到嵌套子目录的所有 `.gitignore`
 
 附加规则：
 

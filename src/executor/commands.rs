@@ -767,6 +767,15 @@ mod tests {
         fs::write(tmp.path().join(".cache").join("visible.txt"), "needle").unwrap();
         fs::create_dir(tmp.path().join(".secret")).unwrap();
         fs::write(tmp.path().join(".secret").join("hidden.txt"), "needle").unwrap();
+        fs::create_dir(tmp.path().join("pkg")).unwrap();
+        fs::write(
+            tmp.path().join("pkg").join(".gitignore"),
+            "hidden.txt\n*.tmp\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("pkg").join("hidden.txt"), "needle").unwrap();
+        fs::write(tmp.path().join("pkg").join("drop.tmp"), "needle").unwrap();
+        fs::write(tmp.path().join("pkg").join("visible.rs"), "needle").unwrap();
         fs::write(tmp.path().join("visible.txt"), "needle").unwrap();
 
         let config = PathFilterConfig {
@@ -788,8 +797,11 @@ mod tests {
         assert!(tree.contains("visible.txt"));
         assert!(tree.contains("keep.txt"));
         assert!(tree.contains("keep.log"));
+        assert!(tree.contains("visible.rs"));
         assert!(!tree.contains("skip.txt"));
         assert!(!tree.contains("drop.log"));
+        assert!(!tree.contains("hidden.txt"));
+        assert!(!tree.contains("drop.tmp"));
 
         let glob = executor.exec_command(&json!({
             "type": "glob",
@@ -801,8 +813,11 @@ mod tests {
         assert!(glob.contains("/codebase/ignored/keep.txt"));
         assert!(glob.contains("/codebase/logs/keep.log"));
         assert!(glob.contains("/codebase/.cache/visible.txt"));
+        assert!(glob.contains("/codebase/pkg/visible.rs"));
         assert!(!glob.contains("/codebase/ignored/skip.txt"));
         assert!(!glob.contains("/codebase/logs/drop.log"));
+        assert!(!glob.contains("/codebase/pkg/hidden.txt"));
+        assert!(!glob.contains("/codebase/pkg/drop.tmp"));
 
         let included_readfile = executor.exec_command(&json!({
             "type": "readfile",
@@ -831,6 +846,13 @@ mod tests {
             })),
             "Error: file not visible: /codebase/.secret/hidden.txt"
         );
+        assert_eq!(
+            executor.exec_command(&json!({
+                "type": "readfile",
+                "file": "/codebase/pkg/hidden.txt"
+            })),
+            "Error: file not visible: /codebase/pkg/hidden.txt"
+        );
 
         let logs = executor.exec_command(&json!({
             "type": "ls",
@@ -838,6 +860,15 @@ mod tests {
         }));
         assert!(logs.contains("keep.log"));
         assert!(!logs.contains("drop.log"));
+
+        let pkg = executor.exec_command(&json!({
+            "type": "ls",
+            "path": "/codebase/pkg",
+            "all": true
+        }));
+        assert!(pkg.contains("visible.rs"));
+        assert!(!pkg.contains("hidden.txt"));
+        assert!(!pkg.contains("drop.tmp"));
 
         let root = executor.exec_command(&json!({
             "type": "ls",
@@ -864,8 +895,11 @@ mod tests {
             assert!(result.contains("/codebase/ignored/keep.txt"));
             assert!(result.contains("/codebase/logs/keep.log"));
             assert!(result.contains("/codebase/.cache/visible.txt"));
+            assert!(result.contains("/codebase/pkg/visible.rs"));
             assert!(!result.contains("/codebase/ignored/skip.txt"));
             assert!(!result.contains("/codebase/logs/drop.log"));
+            assert!(!result.contains("/codebase/pkg/hidden.txt"));
+            assert!(!result.contains("/codebase/pkg/drop.tmp"));
         }
     }
 

@@ -407,4 +407,20 @@ mod tests {
         assert!(lines.contains(&"src/main.rs"));
         assert!(!lines.contains(&"/codebase/src/main.rs"));
     }
+
+    #[test]
+    fn get_repo_map_respects_nested_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg").join(".gitignore"), "hidden.txt\n").unwrap();
+        fs::write(tmp.path().join("pkg").join("hidden.txt"), "").unwrap();
+        fs::write(tmp.path().join("pkg").join("visible.rs"), "").unwrap();
+
+        let result = get_repo_map(tmp.path(), 2, &PathFilterConfig::default());
+        let lines = result.tree.lines().collect::<Vec<_>>();
+
+        assert!(lines.contains(&"pkg/"));
+        assert!(lines.contains(&"pkg/visible.rs"));
+        assert!(!lines.contains(&"pkg/hidden.txt"));
+    }
 }

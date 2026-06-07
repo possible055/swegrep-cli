@@ -1,6 +1,8 @@
 use ignore::Match;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
 pub struct PathFilterConfig {
@@ -49,7 +51,7 @@ impl PathFilterConfig {
 pub struct PathFilter {
     enabled: bool,
     root: PathBuf,
-    gitignore: Gitignore,
+    gitignores: Mutex<HashMap<PathBuf, Gitignore>>,
     include: Gitignore,
     exclude: Gitignore,
     include_patterns: Vec<String>,
@@ -62,6 +64,7 @@ impl PathFilter {
         let mut warnings = config.warnings;
 
         let gitignore = build_gitignore_file(&root, &mut warnings);
+        let gitignores = Mutex::new(HashMap::from([(root.clone(), gitignore)]));
         let include = build_pattern_set(
             &root,
             "include.txt",
@@ -78,7 +81,7 @@ impl PathFilter {
         Self {
             enabled: config.enabled,
             root,
-            gitignore,
+            gitignores,
             include,
             exclude,
             include_patterns: config.include_patterns,
@@ -114,7 +117,7 @@ impl PathFilter {
         if has_dot_component(rel) {
             return false;
         }
-        if matches_ignore(&self.gitignore, rel, is_dir) {
+        if self.matches_gitignore(path, is_dir) {
             return false;
         }
         true
@@ -123,20 +126,83 @@ impl PathFilter {
     fn relative_path(&self, path: &Path) -> PathBuf {
         path.strip_prefix(&self.root).unwrap_or(path).to_path_buf()
     }
+
+    fn matches_gitignore(&self, path: &Path, is_dir: bool) -> bool {
+        let mut ignored = false;
+        for dir in self.gitignore_dirs(path) {
+            match self
+                .gitignore_for_dir(&dir)
+                .matched_path_or_any_parents(path, is_dir)
+            {
+                Match::Ignore(_) => ignored = true,
+                Match::Whitelist(_) => ignored = false,
+                Match::None => {}
+            }
+        }
+        ignored
+    }
+
+    fn gitignore_dirs(&self, path: &Path) -> Vec<PathBuf> {
+        let Ok(rel) = path.strip_prefix(&self.root) else {
+            return vec![self.root.clone()];
+        };
+        let mut dirs = vec![self.root.clone()];
+        let Some(parent) = rel.parent() else {
+            return dirs;
+        };
+
+        let mut current = self.root.clone();
+        for component in parent.components() {
+            current.push(component);
+            dirs.push(current.clone());
+        }
+        dirs
+    }
+
+    fn gitignore_for_dir(&self, dir: &Path) -> Gitignore {
+        if let Ok(cache) = self.gitignores.lock()
+            && let Some(matcher) = cache.get(dir)
+        {
+            return matcher.clone();
+        }
+
+        let matcher = build_gitignore_file_quiet(dir);
+        let Ok(mut cache) = self.gitignores.lock() else {
+            return matcher;
+        };
+        cache
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| matcher.clone())
+            .clone()
+    }
 }
 
 fn build_gitignore_file(root: &Path, warnings: &mut Vec<String>) -> Gitignore {
+    build_gitignore_file_with_warning(root, |warning| warnings.push(warning))
+}
+
+fn build_gitignore_file_quiet(root: &Path) -> Gitignore {
+    build_gitignore_file_with_warning(root, |_| {})
+}
+
+fn build_gitignore_file_with_warning(root: &Path, mut warn: impl FnMut(String)) -> Gitignore {
     let mut builder = GitignoreBuilder::new(root);
     let gitignore_path = root.join(".gitignore");
     if gitignore_path.exists()
         && let Some(err) = builder.add(&gitignore_path)
     {
-        warnings.push(format!(
+        warn(format!(
             "Could not load {}: {err}",
             gitignore_path.display()
         ));
     }
-    build_or_empty(builder, root, ".gitignore", warnings)
+    match builder.build() {
+        Ok(gitignore) => gitignore,
+        Err(err) => {
+            warn(format!("Could not build .gitignore matcher: {err}"));
+            empty_gitignore(root)
+        }
+    }
 }
 
 fn build_pattern_set(
@@ -166,11 +232,15 @@ fn build_or_empty(
         Ok(gitignore) => gitignore,
         Err(err) => {
             warnings.push(format!("Could not build {source_name} matcher: {err}"));
-            GitignoreBuilder::new(root)
-                .build()
-                .expect("empty gitignore matcher should build")
+            empty_gitignore(root)
         }
     }
+}
+
+fn empty_gitignore(root: &Path) -> Gitignore {
+    GitignoreBuilder::new(root)
+        .build()
+        .expect("empty gitignore matcher should build")
 }
 
 fn matches_ignore(matcher: &Gitignore, path: &Path, is_dir: bool) -> bool {
@@ -222,6 +292,47 @@ mod tests {
         assert!(!filter.is_visible(&tmp.path().join("target"), true));
         assert!(!filter.is_visible(&tmp.path().join("debug.log"), false));
         assert!(filter.is_visible(&tmp.path().join("src/main.rs"), false));
+    }
+
+    #[test]
+    fn nested_gitignore_excludes_only_its_descendants() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg").join(".gitignore"), "*.tmp\n").unwrap();
+        let filter = PathFilter::new(tmp.path(), PathFilterConfig::default());
+
+        assert!(filter.is_visible(&tmp.path().join("root.tmp"), false));
+        assert!(filter.is_visible(&tmp.path().join("pkg"), true));
+        assert!(!filter.is_visible(&tmp.path().join("pkg").join("drop.tmp"), false));
+        assert!(filter.is_visible(&tmp.path().join("pkg").join("keep.rs"), false));
+    }
+
+    #[test]
+    fn nested_gitignore_can_override_parent_file_pattern() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), "*.log\n").unwrap();
+        fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg").join(".gitignore"), "!keep.log\n").unwrap();
+        let filter = PathFilter::new(tmp.path(), PathFilterConfig::default());
+
+        assert!(!filter.is_visible(&tmp.path().join("root.log"), false));
+        assert!(filter.is_visible(&tmp.path().join("pkg").join("keep.log"), false));
+        assert!(!filter.is_visible(&tmp.path().join("pkg").join("drop.log"), false));
+    }
+
+    #[test]
+    fn include_overrides_nested_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+        fs::write(tmp.path().join("pkg").join(".gitignore"), "*.txt\n").unwrap();
+        let config = PathFilterConfig {
+            include_patterns: vec!["pkg/keep.txt".to_string()],
+            ..PathFilterConfig::default()
+        };
+        let filter = PathFilter::new(tmp.path(), config);
+
+        assert!(filter.is_visible(&tmp.path().join("pkg").join("keep.txt"), false));
+        assert!(!filter.is_visible(&tmp.path().join("pkg").join("drop.txt"), false));
     }
 
     #[test]
