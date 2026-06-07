@@ -17,7 +17,7 @@ const FC_MAX_COMMANDS_ENV: &str = "FC_MAX_COMMANDS";
 const FC_TIMEOUT_MS_ENV: &str = "FC_TIMEOUT_MS";
 
 #[derive(Debug, Parser)]
-#[command(name = "swegrep-cli")]
+#[command(name = "swegrep-cli", version)]
 #[command(disable_help_subcommand = true)]
 struct Cli {
     #[command(subcommand)]
