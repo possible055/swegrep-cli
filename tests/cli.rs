@@ -91,3 +91,19 @@ fn search_requires_path() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--path"));
 }
+
+#[test]
+fn search_rejects_turns_below_minimum() {
+    let tmp = TempDir::new().unwrap();
+    let output = Command::cargo_bin("swegrep-cli")
+        .unwrap()
+        .args(["search", "dummy_query", "--path"])
+        .arg(tmp.path())
+        .args(["--turns", "3"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("turns must be between 4 and 6"));
+}

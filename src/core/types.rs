@@ -78,7 +78,7 @@ impl SearchOptions {
             jwt: None,
             app_version: None,
             ls_version: None,
-            max_turns: 3,
+            max_turns: 4,
             max_commands: 8,
             max_results: 10,
             tree_depth: 4,

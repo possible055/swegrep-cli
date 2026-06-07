@@ -49,7 +49,7 @@ struct SearchArgs {
     #[arg(
         long,
         value_parser = parse_turns,
-        help = "Maximum search rounds. Default is from FC_MAX_TURNS or 3."
+        help = "Maximum search rounds. Default is from FC_MAX_TURNS or 4."
     )]
     turns: Option<usize>,
 }
@@ -68,7 +68,7 @@ struct ExtractKeyArgs {
 
 pub fn run() -> i32 {
     load_skill_env();
-    let default_turns = read_env_range(FC_MAX_TURNS_ENV, 3, 3..=5);
+    let default_turns = read_env_range(FC_MAX_TURNS_ENV, 4, 4..=6);
     let scope_snapshot_tree_depth = read_env_range(SCOPE_SNAPSHOT_TREE_DEPTH_ENV, 4, 0..=8);
     let max_commands = read_env_range(FC_MAX_COMMANDS_ENV, 8, 1..=8);
     let timeout_ms = read_timeout_ms_env();
@@ -165,7 +165,7 @@ fn parse_env_u64_range_value(raw: &str, range: std::ops::RangeInclusive<u64>) ->
 }
 
 fn parse_turns(value: &str) -> Result<usize, String> {
-    parse_range(value, 3..=5, "turns")
+    parse_range(value, 4..=6, "turns")
 }
 
 fn parse_range(
@@ -378,11 +378,11 @@ mod tests {
 
     #[test]
     fn fc_max_turns_env_accepts_expected_range() {
-        assert_eq!(parse_env_range_value("3", 3..=5), Some(3));
-        assert_eq!(parse_env_range_value("5", 3..=5), Some(5));
-        assert_eq!(parse_env_range_value("2", 3..=5), None);
-        assert_eq!(parse_env_range_value("6", 3..=5), None);
-        assert_eq!(parse_env_range_value("not-a-number", 3..=5), None);
+        assert_eq!(parse_env_range_value("4", 4..=6), Some(4));
+        assert_eq!(parse_env_range_value("6", 4..=6), Some(6));
+        assert_eq!(parse_env_range_value("3", 4..=6), None);
+        assert_eq!(parse_env_range_value("7", 4..=6), None);
+        assert_eq!(parse_env_range_value("not-a-number", 4..=6), None);
     }
 
     #[test]

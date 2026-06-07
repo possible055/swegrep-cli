@@ -27,13 +27,13 @@ The packaged executable is located next to this skill file under:
 
 Run codebase search from the target repository root:
 ```sh
-./bin/swegrep-cli search "<natural language query>" --path <repo-path> --turns 3
+./bin/swegrep-cli search "<natural language query>" --path <repo-path> --turns 4
 ```
 
 **Parameters:**
 * `<natural language query>`: A broad semantic question about the codebase.
 * `--path`: Target repository root to search. Use an absolute path when possible.
-* `--turns <3-5>`: Maximum search rounds. Use `3` by default for normal questions. Increase to `4` or `5` only when the task is broad, ambiguous, or likely to require deeper codebase traversal.
+* `--turns <4-6>`: Maximum search rounds. Use `4` by default for normal questions. Increase to `5` or `6` only when the task is broad, ambiguous, or likely to require deeper codebase traversal.
 
 ### Extract Key
 

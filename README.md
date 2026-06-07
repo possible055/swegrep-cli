@@ -43,11 +43,11 @@ Optional flags:
 swegrep-cli search "query" \
   --path /path/to/project \
   --api-key sk-ws-01-... \
-  --turns 3
+  --turns 4
 ```
 
 - `--path` is required and should point to the project root.
-- `--turns` accepts values from `3` to `5`.
+- `--turns` accepts values from `4` to `6`.
 
 ### Extract a Windsurf API Key
 
@@ -133,8 +133,10 @@ Supported variables:
 | `FC_RESULT_MAX_LINES` | `80` | Max lines for Windsurf-style non-`readfile` local tool results |
 | `FC_READFILE_MAX_LINES` | `200` | Max lines for Windsurf-style `readfile` tool output |
 | `FC_LINE_MAX_CHARS` | `300` | Max characters kept per line for Windsurf-style tool output |
-| `FC_MAX_TURNS` | `3` | Default maximum search rounds for `search` |
+| `FC_MAX_TURNS` | `4` | Default maximum search rounds for `search` |
 | `FC_TIMEOUT_MS` | `30000` | Streaming timeout in milliseconds |
+| `SWEGREP_DEBUG` | `0` | Enable model-response diagnostics when set to `1`, `true`, `yes`, or `on` |
+| `SWEGREP_DEBUG_LOG` | `~/.config/swegrep/debug.log` | Debug log path for parsed model responses and final answer XML |
 
 ## Acknowledgements
 

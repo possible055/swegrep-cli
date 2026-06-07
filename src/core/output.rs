@@ -194,7 +194,7 @@ mod tests {
         let output = format_search_error(
             &result,
             Some(SearchOutputConfig {
-                max_turns: 3,
+                max_turns: 4,
                 max_results: 10,
                 max_commands: 8,
             }),
@@ -203,7 +203,7 @@ mod tests {
         assert!(output.contains("Error: TIMEOUT: request timed out"));
         assert!(output.contains("[diagnostic] error_type=TIMEOUT"));
         assert!(output.contains("[diagnostic] project_path=/repo"));
-        assert!(output.contains("[config] max_turns=3, max_results=10, max_commands=8"));
+        assert!(output.contains("[config] max_turns=4, max_results=10, max_commands=8"));
         assert!(output.contains("[hint] Try: reduce scope snapshot depth"));
     }
 }

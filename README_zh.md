@@ -43,11 +43,11 @@ swegrep-cli search "where is authentication handled" --path /path/to/project
 swegrep-cli search "query" \
   --path /path/to/project \
   --api-key sk-ws-01-... \
-  --turns 3
+  --turns 4
 ```
 
 - `--path` 是必填项，应指向项目根目录。
-- `--turns` 接受 `3` 到 `5` 之间的值。
+- `--turns` 接受 `4` 到 `6` 之间的值。
 
 ### 提取 Windsurf API 密钥
 
@@ -133,8 +133,10 @@ export SWEGREP_PATH_FILTER=0
 | `FC_RESULT_MAX_LINES` | `80` | Windsurf 风格非 `readfile` 本地工具结果的最大行数 |
 | `FC_READFILE_MAX_LINES` | `200` | Windsurf 风格 `readfile` 工具输出的最大行数 |
 | `FC_LINE_MAX_CHARS` | `300` | Windsurf 风格工具输出中每行保留的最大字符数 |
-| `FC_MAX_TURNS` | `3` | `search` 的默认最大搜索轮数 |
+| `FC_MAX_TURNS` | `4` | `search` 的默认最大搜索轮数 |
 | `FC_TIMEOUT_MS` | `30000` | 流式传输超时（毫秒） |
+| `SWEGREP_DEBUG` | `0` | 设为 `1`、`true`、`yes` 或 `on` 时启用模型回应诊断 |
+| `SWEGREP_DEBUG_LOG` | `~/.config/swegrep/debug.log` | 已解析模型回应与 final answer XML 的 debug log 路径 |
 
 ## 致谢
 

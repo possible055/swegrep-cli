@@ -2,11 +2,18 @@ use crate::executor::{
     InstantContextToolCall as ExecutorToolCall, InstantContextToolUpdate, ToolExecutionStatus,
     ToolExecutor,
 };
+use crate::protobuf::{connect_frame_decode, extract_strings};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::env;
+use std::fs::OpenOptions;
 use std::future::Future;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::auth::{get_api_key, get_cached_jwt};
+use super::credentials;
 use super::error::FastContextError;
 use super::http;
 use super::protocol::{
@@ -16,6 +23,43 @@ use super::protocol::{
 use super::repo::{RepoMap, get_repo_map, parse_answer};
 use super::types::{SearchError, SearchMeta, SearchOptions, SearchResult};
 use super::{SearchOutputConfig, format_search_error, format_search_success};
+
+const MAX_COMPENSATED_TURNS: usize = 2;
+const DEBUG_PREVIEW_CHARS: usize = 4_000;
+
+#[derive(Debug, Clone)]
+struct DebugLogger {
+    path: Option<PathBuf>,
+}
+
+impl DebugLogger {
+    fn from_env() -> Self {
+        if !debug_enabled() {
+            return Self { path: None };
+        }
+
+        let path = env::var_os("SWEGREP_DEBUG_LOG")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_debug_log_path);
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    fn log(&self, message: impl AsRef<str>) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{} {}", debug_timestamp_ms(), message.as_ref());
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 struct InstantContextStep {
@@ -64,6 +108,17 @@ where
             on_progress(message);
         }
     };
+    let debug = DebugLogger::from_env();
+    if let Some(path) = debug.path() {
+        log(&format!("Debug log: {}", path.display()));
+        debug.log(format!(
+            "search_start project_root={} max_turns={} max_commands={} query={}",
+            project_root.display(),
+            options.max_turns,
+            options.max_commands,
+            debug_preview(&options.query, DEBUG_PREVIEW_CHARS)
+        ));
+    }
 
     let api_key = match get_api_key(options.api_key.as_deref(), true) {
         Ok(api_key) => api_key,
@@ -132,14 +187,18 @@ where
         ChatMessage::simple(MessageRole::User, user_content),
     ];
 
-    let total_api_calls = options.max_turns + 1;
-    const MAX_COMPENSATED_TURNS: usize = 2;
     let mut force_answer_injected = false;
     let mut compensated_turns = 0_usize;
     let mut turn = 0_usize;
 
-    while turn < total_api_calls + compensated_turns {
-        log(&format!("Turn {}/{}", turn + 1, total_api_calls));
+    while turn < options.max_turns + 1 + compensated_turns {
+        let progress_turn = format_search_progress_turn(
+            turn,
+            compensated_turns,
+            options.max_turns,
+            force_answer_injected,
+        );
+        log(&progress_turn);
 
         let proto = build_request(
             &api_key,
@@ -159,9 +218,9 @@ where
                     && messages.len() > 4
                 {
                     log(&format!(
-                        "{} on turn {}: trimming context and retrying...",
+                        "{} on {}: trimming context and retrying...",
                         err.code,
-                        turn + 1
+                        format_search_turn_ref(turn, compensated_turns, options.max_turns)
                     ));
                     trim_messages(&mut messages);
                     let retry_proto = build_request(
@@ -202,6 +261,7 @@ where
         };
 
         let mut parsed = parse_response(&response);
+        debug_model_response(&debug, &progress_turn, &response, &parsed);
         if matches!(&parsed, ParsedModelTurn::Text(text) if text.trim().is_empty()) {
             log("Empty model response on turn; retrying once...");
             let retry_proto = build_request(
@@ -225,6 +285,12 @@ where
                 }
             };
             parsed = parse_response(&response);
+            debug_model_response(
+                &debug,
+                &format!("{progress_turn} retry"),
+                &response,
+                &parsed,
+            );
             if matches!(&parsed, ParsedModelTurn::Text(text) if text.trim().is_empty()) {
                 return SearchResult {
                     files: Vec::new(),
@@ -257,10 +323,32 @@ where
                     log("Received final answer");
                     let mut result = parse_answer(&text, &project_root);
                     result.files.truncate(options.max_results);
+                    debug_answer_result(&debug, "text", &text, result.files.len());
                     result.rg_patterns = unique_patterns(executor.collected_rg_patterns());
                     result.meta = search_meta(&project_root, &repo_map, None);
                     return result;
                 }
+
+                let effective_turns_used = (turn + 1)
+                    .saturating_sub(compensated_turns)
+                    .min(options.max_turns);
+                if !force_answer_injected {
+                    messages.push(ChatMessage::simple(MessageRole::Assistant, text.clone()));
+                    if effective_turns_used < options.max_turns {
+                        messages.push(ChatMessage::simple(
+                            MessageRole::User,
+                            format_search_turn_status(effective_turns_used, options.max_turns),
+                        ));
+                        log("Plain-text response without answer; continuing search");
+                    } else {
+                        messages.push(ChatMessage::simple(MessageRole::User, FINAL_FORCE_ANSWER));
+                        force_answer_injected = true;
+                        log("Injected force-answer prompt after plain-text response");
+                    }
+                    turn += 1;
+                    continue;
+                }
+
                 return SearchResult {
                     files: Vec::new(),
                     rg_patterns: unique_patterns(executor.collected_rg_patterns()),
@@ -280,6 +368,7 @@ where
             log("Received final answer");
             let mut result = parse_answer(answer_xml, &project_root);
             result.files.truncate(options.max_results);
+            debug_answer_result(&debug, "tool_call", answer_xml, result.files.len());
             result.rg_patterns = unique_patterns(executor.collected_rg_patterns());
             result.meta = search_meta(&project_root, &repo_map, None);
             return result;
@@ -306,7 +395,7 @@ where
             if !has_valid_command && compensated_turns < MAX_COMPENSATED_TURNS {
                 compensated_turns += 1;
                 log(&format!(
-                    "Turn compensation: no valid restricted_exec commands, extending search by 1 turn ({compensated_turns}/{MAX_COMPENSATED_TURNS})"
+                    "No valid restricted_exec commands; scheduling compensation turn {compensated_turns}/{MAX_COMPENSATED_TURNS}"
                 ));
             } else if !has_valid_command {
                 log(&format!(
@@ -410,11 +499,165 @@ fn unique_patterns(patterns: Vec<String>) -> Vec<String> {
     unique
 }
 
+fn debug_enabled() -> bool {
+    env::var("SWEGREP_DEBUG")
+        .ok()
+        .is_some_and(|value| matches_bool_env(&value))
+}
+
+fn matches_bool_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn default_debug_log_path() -> PathBuf {
+    credentials::get_config_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("debug.log")
+}
+
+fn debug_timestamp_ms() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("[{millis}]")
+}
+
+fn debug_model_response(
+    debug: &DebugLogger,
+    turn_label: &str,
+    response: &[u8],
+    parsed: &ParsedModelTurn,
+) {
+    if debug.path().is_none() {
+        return;
+    }
+    debug.log(format!(
+        "model_response turn={} bytes={} parsed={}",
+        debug_preview(turn_label, 128),
+        response.len(),
+        debug_parsed_turn_summary(parsed)
+    ));
+    let strings = debug_response_strings(response);
+    if !strings.is_empty() {
+        debug.log(format!(
+            "model_response_strings turn={} values={}",
+            debug_preview(turn_label, 128),
+            debug_preview(&strings.join(" | "), DEBUG_PREVIEW_CHARS)
+        ));
+    }
+}
+
+fn debug_response_strings(response: &[u8]) -> Vec<String> {
+    connect_frame_decode(response)
+        .into_iter()
+        .flat_map(|frame| {
+            let mut values = extract_strings(&frame);
+            let raw = String::from_utf8_lossy(&frame).replace('\u{fffd}', "");
+            if raw.len() > 10 && !values.iter().any(|value| value == &raw) {
+                values.push(raw);
+            }
+            values
+        })
+        .map(|value| debug_preview(&value, DEBUG_PREVIEW_CHARS))
+        .filter(|value| !value.trim().is_empty())
+        .collect()
+}
+
+fn debug_parsed_turn_summary(parsed: &ParsedModelTurn) -> String {
+    match parsed {
+        ParsedModelTurn::ToolCalls { thinking, calls } => {
+            let call_count = calls.len();
+            let call_summaries = calls
+                .iter()
+                .map(|call| {
+                    format!(
+                        "{} args={}",
+                        debug_preview(&call.name, 128),
+                        debug_preview(&call.args.to_string(), DEBUG_PREVIEW_CHARS)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "tool_calls count={} thinking={} calls=[{}]",
+                call_count,
+                debug_preview(thinking, DEBUG_PREVIEW_CHARS),
+                call_summaries
+            )
+        }
+        ParsedModelTurn::Text(text) => {
+            format!("text value={}", debug_preview(text, DEBUG_PREVIEW_CHARS))
+        }
+        ParsedModelTurn::Error(error) => {
+            format!("error value={}", debug_preview(error, DEBUG_PREVIEW_CHARS))
+        }
+    }
+}
+
+fn debug_answer_result(debug: &DebugLogger, source: &str, answer_xml: &str, file_count: usize) {
+    debug.log(format!(
+        "final_answer source={} files={} xml={}",
+        source,
+        file_count,
+        debug_preview(answer_xml, DEBUG_PREVIEW_CHARS)
+    ));
+}
+
+fn debug_preview(value: &str, max_chars: usize) -> String {
+    let mut preview = value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    if preview.chars().count() > max_chars {
+        preview = preview.chars().take(max_chars).collect::<String>();
+        preview.push_str("...");
+    }
+    preview
+}
+
 fn format_search_turn_status(used: usize, max_turns: usize) -> String {
     format!(
         "Search turns used: {used}. Search turns remaining: {}.",
         max_turns.saturating_sub(used)
     )
+}
+
+fn format_search_progress_turn(
+    turn: usize,
+    compensated_turns: usize,
+    max_turns: usize,
+    force_answer_injected: bool,
+) -> String {
+    if force_answer_injected {
+        return "Final answer turn".to_string();
+    }
+    if is_compensation_turn(turn, compensated_turns, max_turns) {
+        return format!("Compensation turn {compensated_turns}/{MAX_COMPENSATED_TURNS}");
+    }
+    format!(
+        "Turn {}",
+        format_search_turn_ref(turn, compensated_turns, max_turns)
+    )
+}
+
+fn is_compensation_turn(turn: usize, compensated_turns: usize, max_turns: usize) -> bool {
+    compensated_turns > 0 && (turn + 1).saturating_sub(compensated_turns) >= max_turns
+}
+
+fn format_search_turn_ref(turn: usize, compensated_turns: usize, max_turns: usize) -> String {
+    let max_turns = max_turns.max(1);
+    let used = (turn + 1)
+        .saturating_sub(compensated_turns)
+        .max(1)
+        .min(max_turns);
+    format!("{used}/{max_turns}")
 }
 
 fn build_user_content(query: &str, repo_map: &RepoMap) -> String {
@@ -599,6 +842,76 @@ mod tests {
         assert!(output.contains("command2_result:\nError: tool timed out"));
         assert!(!output.contains("status="));
         assert!(!output.contains("duration_ms="));
+    }
+
+    #[test]
+    fn search_progress_turn_log_uses_configured_search_turn_count() {
+        assert_eq!(format_search_progress_turn(3, 0, 4, false), "Turn 4/4");
+        assert_eq!(format_search_progress_turn(4, 0, 5, false), "Turn 5/5");
+        assert_eq!(format_search_progress_turn(5, 0, 6, false), "Turn 6/6");
+        assert_eq!(
+            format_search_progress_turn(5, 1, 5, false),
+            "Compensation turn 1/2"
+        );
+        assert_eq!(
+            format_search_progress_turn(6, 2, 5, false),
+            "Compensation turn 2/2"
+        );
+        assert_eq!(
+            format_search_progress_turn(3, 0, 3, true),
+            "Final answer turn"
+        );
+    }
+
+    #[test]
+    fn debug_parsed_turn_summary_includes_model_values() {
+        let parsed = ParsedModelTurn::ToolCalls {
+            thinking: "look\naround".to_string(),
+            calls: vec![crate::core::protocol::ParsedToolCall {
+                id: "tool-1".to_string(),
+                name: "restricted_exec".to_string(),
+                args: serde_json::json!({
+                    "command1": {
+                        "type": "rg",
+                        "pattern": "format_search_success",
+                        "path": "/codebase/src"
+                    }
+                }),
+            }],
+        };
+
+        let summary = debug_parsed_turn_summary(&parsed);
+
+        assert!(summary.contains("tool_calls count=1"));
+        assert!(summary.contains("restricted_exec"));
+        assert!(summary.contains("format_search_success"));
+        assert!(summary.contains("look\\naround"));
+    }
+
+    #[test]
+    fn debug_preview_truncates_and_escapes_control_characters() {
+        assert_eq!(debug_preview("a\nb\tc", 20), "a\\nb\\tc");
+        assert_eq!(debug_preview("abcdef", 3), "abc...");
+    }
+
+    #[test]
+    fn debug_model_response_writes_model_values_to_log() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("debug.log");
+        let debug = DebugLogger {
+            path: Some(log_path.clone()),
+        };
+        let mut response = ProtobufEncoder::new();
+        response.write_string(1, "model text value");
+        let frame = connect_frame_encode(&response.to_bytes(), false);
+        let parsed = parse_response(&frame);
+
+        debug_model_response(&debug, "Turn 1/4", &frame, &parsed);
+
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("model_response turn=Turn 1/4"));
+        assert!(log.contains("model_response_strings"));
+        assert!(log.contains("model text value"));
     }
 
     #[tokio::test]
@@ -921,24 +1234,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_loop_returns_raw_response_for_plain_text_without_answer() {
+    async fn search_loop_returns_raw_response_for_plain_text_after_force_answer() {
         let mut t1_encoder = ProtobufEncoder::new();
         t1_encoder.write_string(1, "I could not find a matching implementation.");
         let t1_frame = connect_frame_encode(&t1_encoder.to_bytes(), false);
 
-        let responses = Arc::new(Mutex::new(VecDeque::from([t1_frame])));
+        let mut t2_encoder = ProtobufEncoder::new();
+        t2_encoder.write_string(1, "Still no structured answer.");
+        let t2_frame = connect_frame_encode(&t2_encoder.to_bytes(), false);
+
+        let responses = Arc::new(Mutex::new(VecDeque::from([t1_frame, t2_frame])));
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
         let tmp = TempDir::new().unwrap();
 
         let mut options = SearchOptions::new("find missing thing", tmp.path());
         options.api_key = Some("sk-ws-01-key".to_string());
         options.jwt = Some("mocked.jwt.token".to_string());
-        options.max_turns = 2;
+        options.max_turns = 1;
 
         let result = search_with_streaming(options, None, {
             let responses = Arc::clone(&responses);
-            move |_, _, _, _| {
+            let requests = Arc::clone(&requests);
+            move |proto, _, _, _| {
                 let responses = Arc::clone(&responses);
-                async move { Ok(responses.lock().unwrap().pop_front().unwrap()) }
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&proto).to_string());
+                    Ok(responses.lock().unwrap().pop_front().unwrap())
+                }
             }
         })
         .await;
@@ -946,9 +1272,71 @@ mod tests {
         assert!(result.error.is_none());
         assert_eq!(
             result.raw_response.as_deref(),
-            Some("I could not find a matching implementation.")
+            Some("Still no structured answer.")
         );
         assert!(result.files.is_empty());
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains(FINAL_FORCE_ANSWER));
+    }
+
+    #[tokio::test]
+    async fn search_loop_injects_force_answer_after_plain_text_on_last_search_turn() {
+        let t1_frame = connect_frame_encode(
+            br#"{"output":"read context","tool_calls":[{"id":"q1","name":"restricted_exec","args":{"command1":{"type":"readfile","file":"/codebase/test.txt","start_line":1,"end_line":1}}}]}"#,
+            false,
+        );
+
+        let mut t2_encoder = ProtobufEncoder::new();
+        t2_encoder.write_string(1, "I could not find a matching implementation.");
+        let t2_frame = connect_frame_encode(&t2_encoder.to_bytes(), false);
+
+        let mut answer_encoder = ProtobufEncoder::new();
+        answer_encoder.write_string(
+            1,
+            r#"[TOOL_CALLS]answer[ARGS]{"answer": "<ANSWER><file path=\"/codebase/test.txt\"><range>1-1</range></file></ANSWER>"}"#,
+        );
+        let answer_frame = connect_frame_encode(&answer_encoder.to_bytes(), false);
+
+        let responses = Arc::new(Mutex::new(VecDeque::from([
+            t1_frame,
+            t2_frame,
+            answer_frame,
+        ])));
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("test.txt"), "line1").unwrap();
+
+        let mut options = SearchOptions::new("find test", tmp.path());
+        options.api_key = Some("sk-ws-01-key".to_string());
+        options.jwt = Some("mocked.jwt.token".to_string());
+        options.max_turns = 2;
+
+        let result = search_with_streaming(options, None, {
+            let responses = Arc::clone(&responses);
+            let requests = Arc::clone(&requests);
+            move |proto, _, _, _| {
+                let responses = Arc::clone(&responses);
+                let requests = Arc::clone(&requests);
+                async move {
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&proto).to_string());
+                    Ok(responses.lock().unwrap().pop_front().unwrap())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.error.is_none());
+        assert_eq!(result.files.len(), 1);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].contains(FINAL_FORCE_ANSWER));
+        assert!(requests[2].contains("I could not find a matching implementation."));
     }
 
     #[tokio::test]
