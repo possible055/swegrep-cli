@@ -100,12 +100,12 @@ swegrep-cli extract-key --db-path /path/to/state.vscdb
 - 忽略空行和以 `#` 开头的行。
 - 排除隐藏的点路径（例如 `.cache/`），除非显式包含。
 
-全局过滤文件：
+过滤文件只会从打包的 `swe-grep` 目录加载：
 
-| 文件 | Linux | Windows |
-| --- | --- | --- |
-| `include.txt` | `~/.config/swegrep/include.txt` | `~/.swegrep/include.txt` |
-| `exclude.txt` | `~/.config/swegrep/exclude.txt` | `~/.swegrep/exclude.txt` |
+| 文件 | 位置 |
+| --- | --- |
+| `include.txt` | `swe-grep/include.txt` |
+| `exclude.txt` | `swe-grep/exclude.txt` |
 
 通过以下方式禁用共享路径过滤：
 
@@ -115,10 +115,11 @@ export SWEGREP_PATH_FILTER=0
 
 ## 环境变量
 
-启动时，CLI 可以选择从与 `config.json` 相同的配置目录中加载 `.env` 文件：
+启动时，CLI 会选择性加载打包的环境文件：
 
-- macOS / Linux: `~/.config/swegrep/.env`
-- Windows: `~/.swegrep/.env`
+- `swe-grep/.env`
+
+打包的 `.env` 默认全部注释。
 
 支持的变量：
 
@@ -131,7 +132,7 @@ export SWEGREP_PATH_FILTER=0
 | `SWEGREP_PATH_FILTER` | `1` | 启用共享路径过滤；使用 `0`、`false`、`no` 或 `off` 禁用 |
 | `FC_MAX_COMMANDS` | `8` | 每一轮搜索的最大并行受限命令数 |
 | `FC_RESULT_MAX_LINES` | `80` | Windsurf 风格非 `readfile` 本地工具结果的最大行数 |
-| `FC_READFILE_MAX_LINES` | `200` | Windsurf 风格 `readfile` 工具输出的最大行数 |
+| `FC_READFILE_MAX_LINES` | `400` | Windsurf 风格 `readfile` 工具输出的最大行数 |
 | `FC_LINE_MAX_CHARS` | `300` | Windsurf 风格工具输出中每行保留的最大字符数 |
 | `FC_MAX_TURNS` | `4` | `search` 的默认最大搜索轮数 |
 | `FC_TIMEOUT_MS` | `30000` | 流式传输超时（毫秒） |

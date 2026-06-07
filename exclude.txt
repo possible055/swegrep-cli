@@ -1,0 +1,6 @@
+# Add gitignore-style deny patterns here.
+# Patterns are evaluated relative to the searched project root.
+#
+# Examples:
+# target/
+# *.log

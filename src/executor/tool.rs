@@ -66,7 +66,7 @@ impl ToolExecutor {
                 1,
                 500,
             ),
-            readfile_result_max_lines: read_int_env("FC_READFILE_MAX_LINES", 200, 1, 10_000),
+            readfile_result_max_lines: read_int_env("FC_READFILE_MAX_LINES", 400, 1, 10_000),
             tool_line_max_chars: bounded_int(
                 line_max_chars,
                 read_int_env("FC_LINE_MAX_CHARS", 300, 20, 10_000),
@@ -244,7 +244,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let executor = ToolExecutor::new(tmp.path());
         let long_line = "a".repeat(400);
-        let contents = (1..=210)
+        let contents = (1..=410)
             .map(|_| long_line.clone())
             .collect::<Vec<_>>()
             .join("\n");
@@ -253,8 +253,8 @@ mod tests {
         let output =
             executor.exec_command(&json!({"type": "readfile", "file": "/codebase/test.txt"}));
 
-        assert!(output.contains("200:"));
-        assert!(!output.contains("201:"));
+        assert!(output.contains("400:"));
+        assert!(!output.contains("401:"));
         assert!(output.ends_with("... (lines truncated) ..."));
         assert_eq!(output.lines().next().unwrap().len(), 300);
     }

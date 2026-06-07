@@ -1,6 +1,5 @@
 use crate::core::{
-    self, SearchOptions, extract_key, format_search_success, mask_api_key, save_cached_api_key,
-    search,
+    SearchOptions, extract_key, format_search_success, mask_api_key, save_cached_api_key, search,
 };
 use crate::path_filter::PathFilterConfig;
 use crate::rg::resolve_rg_path;
@@ -11,6 +10,10 @@ use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+const ENV_FILE_NAME: &str = ".env";
+const INCLUDE_FILE_NAME: &str = "include.txt";
+const EXCLUDE_FILE_NAME: &str = "exclude.txt";
+const SKILL_FILE_NAME: &str = "SKILL.md";
 const SCOPE_SNAPSHOT_TREE_DEPTH_ENV: &str = "SCOPE_SNAPSHOT_TREE_DEPTH";
 const FC_MAX_TURNS_ENV: &str = "FC_MAX_TURNS";
 const FC_MAX_COMMANDS_ENV: &str = "FC_MAX_COMMANDS";
@@ -87,13 +90,12 @@ pub fn run() -> i32 {
 }
 
 pub fn load_skill_env() {
-    let env_path = core::get_config_path()
-        .parent()
-        .map(Path::to_path_buf)
-        .map(|dir| dir.join(".env"));
-    let Some(env_path) = env_path else {
-        return;
-    };
+    if let Some(env_path) = packaged_config_file(ENV_FILE_NAME) {
+        load_env_file(&env_path);
+    }
+}
+
+fn load_env_file(env_path: &Path) {
     let Ok(text) = fs::read_to_string(env_path) else {
         return;
     };
@@ -123,6 +125,24 @@ pub fn load_skill_env() {
             set_env_var(key, &value);
         }
     }
+}
+
+fn packaged_config_file(file_name: &str) -> Option<PathBuf> {
+    let current_exe = env::current_exe().ok();
+    packaged_config_file_from(current_exe.as_deref(), file_name)
+}
+
+fn packaged_config_file_from(current_exe: Option<&Path>, file_name: &str) -> Option<PathBuf> {
+    packaged_skill_dir_from(current_exe).map(|dir| dir.join(file_name))
+}
+
+fn packaged_skill_dir_from(current_exe: Option<&Path>) -> Option<PathBuf> {
+    let bin_dir = current_exe?.parent()?;
+    let skill_dir = bin_dir.parent()?;
+    skill_dir
+        .join(SKILL_FILE_NAME)
+        .is_file()
+        .then(|| skill_dir.to_path_buf())
 }
 
 fn set_env_var(key: &str, value: &str) {
@@ -295,10 +315,6 @@ fn read_path_filter_config() -> PathFilterConfig {
         return PathFilterConfig::disabled();
     }
 
-    let Some(config_dir) = core::get_config_path().parent().map(Path::to_path_buf) else {
-        return PathFilterConfig::default();
-    };
-
     let mut warnings = Vec::new();
     if env::var("SWEGREP_PATH_FILTER").is_ok() && path_filter_enabled.is_none() {
         warnings.push(
@@ -306,8 +322,10 @@ fn read_path_filter_config() -> PathFilterConfig {
                 .to_string(),
         );
     }
-    let include_patterns = read_filter_patterns(&config_dir.join("include.txt"), &mut warnings);
-    let exclude_patterns = read_filter_patterns(&config_dir.join("exclude.txt"), &mut warnings);
+    let include_patterns =
+        read_filter_patterns_from_packaged_config(INCLUDE_FILE_NAME, &mut warnings);
+    let exclude_patterns =
+        read_filter_patterns_from_packaged_config(EXCLUDE_FILE_NAME, &mut warnings);
 
     PathFilterConfig {
         enabled: true,
@@ -324,6 +342,16 @@ fn read_bool_env(name: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn read_filter_patterns_from_packaged_config(
+    file_name: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let Some(path) = packaged_config_file(file_name) else {
+        return Vec::new();
+    };
+    read_filter_patterns(&path, warnings)
 }
 
 fn read_filter_patterns(path: &Path, warnings: &mut Vec<String>) -> Vec<String> {
@@ -357,6 +385,7 @@ fn absolute_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn scope_snapshot_tree_depth_env_accepts_expected_range() {
@@ -400,6 +429,44 @@ mod tests {
         assert_eq!(
             parse_env_u64_range_value("not-a-number", 1_000..=300_000),
             None
+        );
+    }
+
+    #[test]
+    fn packaged_skill_dir_requires_packaged_skill_layout() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("swe-grep");
+        let bin_dir = skill_dir.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(skill_dir.join(SKILL_FILE_NAME), "").unwrap();
+
+        let current_exe = bin_dir.join("swegrep-cli");
+        assert_eq!(
+            packaged_skill_dir_from(Some(&current_exe)).as_deref(),
+            Some(skill_dir.as_path())
+        );
+    }
+
+    #[test]
+    fn packaged_skill_dir_ignores_regular_bin_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let current_exe = tmp.path().join("bin").join("swegrep-cli");
+
+        assert_eq!(packaged_skill_dir_from(Some(&current_exe)), None);
+    }
+
+    #[test]
+    fn packaged_config_file_uses_packaged_skill_dir_only() {
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("swe-grep");
+        let bin_dir = skill_dir.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(skill_dir.join(SKILL_FILE_NAME), "").unwrap();
+        let expected = skill_dir.join(ENV_FILE_NAME);
+
+        assert_eq!(
+            packaged_config_file_from(Some(&bin_dir.join("swegrep-cli")), ENV_FILE_NAME).as_deref(),
+            Some(expected.as_path())
         );
     }
 }

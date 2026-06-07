@@ -545,6 +545,23 @@ impl ToolExecutor {
             })
             .collect::<Vec<_>>();
 
+        if timeout_budget_ms == 0 {
+            let completed = tool_calls
+                .iter()
+                .map(|call| InstantContextToolUpdate {
+                    step_id: step_id.to_string(),
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    command: Value::Null,
+                    status: ToolExecutionStatus::TimedOut,
+                    output: "Error: tool timed out".to_string(),
+                    timing: InstantContextTiming { duration_ms: 0 },
+                })
+                .collect::<Vec<_>>();
+
+            return pending.into_iter().chain(completed).collect();
+        }
+
         let timeout = Duration::from_millis(timeout_budget_ms.min(u64::MAX as u128) as u64);
         let receivers = tool_calls
             .iter()

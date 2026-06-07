@@ -130,6 +130,13 @@ jobs:
           cp "target/${{ matrix.target }}/release/swegrep-cli" "$staging/bin/"
           cp "target/ripgrep/rg" "$staging/bin/"
           cp SKILL.md "$staging/"
+          cp .env.example "$staging/.env"
+          cp include.txt exclude.txt "$staging/"
+          chmod 755 "$staging" "$staging/bin"
+          chmod 644 "$staging/SKILL.md" "$staging/.env" "$staging/include.txt" "$staging/exclude.txt"
+          chmod 755 "$staging/bin/swegrep-cli" "$staging/bin/rg"
+          test -x "$staging/bin/swegrep-cli"
+          test -x "$staging/bin/rg"
           "$staging/bin/rg" --version
           env PATH="" "$staging/bin/swegrep-cli" search dummy_query --path "$staging/missing-project" 2> "$staging/smoke.stderr" && exit 1
           grep -q "Project path does not exist" "$staging/smoke.stderr"
@@ -149,6 +156,8 @@ jobs:
           Copy-Item "target\${{ matrix.target }}\release\swegrep-cli.exe" "$staging\bin"
           Copy-Item "target\ripgrep\rg.exe" "$staging\bin"
           Copy-Item SKILL.md $staging
+          Copy-Item .env.example "$staging\.env"
+          Copy-Item include.txt, exclude.txt $staging
           & "$staging\bin\rg.exe" --version
           if ($LASTEXITCODE -ne 0) {
             throw "Bundled rg --version failed with exit code $LASTEXITCODE"

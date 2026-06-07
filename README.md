@@ -100,12 +100,12 @@ Additional rules:
 - Empty lines and lines starting with `#` are ignored.
 - Hidden dot-paths such as `.cache/` are excluded unless explicitly included.
 
-Global filter files:
+Filter files are loaded only from the packaged `swe-grep` directory:
 
-| File | Linux | Windows |
-| --- | --- | --- |
-| `include.txt` | `~/.config/swegrep/include.txt` | `~/.swegrep/include.txt` |
-| `exclude.txt` | `~/.config/swegrep/exclude.txt` | `~/.swegrep/exclude.txt` |
+| File | Location |
+| --- | --- |
+| `include.txt` | `swe-grep/include.txt` |
+| `exclude.txt` | `swe-grep/exclude.txt` |
 
 Disable shared path filtering with:
 
@@ -115,10 +115,11 @@ export SWEGREP_PATH_FILTER=0
 
 ## Environment Variables
 
-At startup, the CLI optionally loads a `.env` file from the same config directory as `config.json`:
+At startup, the CLI optionally loads the packaged environment file:
 
-- macOS / Linux: `~/.config/swegrep/.env`
-- Windows: `~/.swegrep/.env`
+- `swe-grep/.env`
+
+Packaged `.env` values are commented by default.
 
 Supported variables:
 
@@ -131,7 +132,7 @@ Supported variables:
 | `SWEGREP_PATH_FILTER` | `1` | Enable shared path filtering; use `0`, `false`, `no`, or `off` to disable |
 | `FC_MAX_COMMANDS` | `8` | Max parallel restricted commands per search round |
 | `FC_RESULT_MAX_LINES` | `80` | Max lines for Windsurf-style non-`readfile` local tool results |
-| `FC_READFILE_MAX_LINES` | `200` | Max lines for Windsurf-style `readfile` tool output |
+| `FC_READFILE_MAX_LINES` | `400` | Max lines for Windsurf-style `readfile` tool output |
 | `FC_LINE_MAX_CHARS` | `300` | Max characters kept per line for Windsurf-style tool output |
 | `FC_MAX_TURNS` | `4` | Default maximum search rounds for `search` |
 | `FC_TIMEOUT_MS` | `30000` | Streaming timeout in milliseconds |

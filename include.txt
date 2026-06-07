@@ -1,0 +1,6 @@
+# Add gitignore-style allow patterns here.
+# Patterns are evaluated relative to the searched project root.
+#
+# Examples:
+# src/**
+# README.md
