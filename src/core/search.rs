@@ -3,7 +3,7 @@ use crate::executor::{
     ToolExecutor,
 };
 use crate::protobuf::{connect_frame_decode, extract_strings};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::env;
 use std::fs::OpenOptions;
@@ -699,7 +699,7 @@ fn restricted_exec_commands(args: &Value, max_commands: usize) -> Vec<ExecutorTo
             map.get(&key).map(|command| ExecutorToolCall {
                 id: key.clone(),
                 name: key,
-                args: command.clone(),
+                args: normalize_restricted_exec_command(command),
             })
         })
         .collect::<Vec<_>>();
@@ -726,11 +726,99 @@ fn has_valid_restricted_exec_command(args: &Value, max_commands: usize) -> bool 
     (1..=max_commands.clamp(1, 8)).any(|idx| {
         let key = format!("command{idx}");
         map.get(&key)
-            .and_then(Value::as_object)
-            .and_then(|command| command.get("type"))
-            .and_then(Value::as_str)
+            .map(normalize_restricted_exec_command)
+            .and_then(|command| {
+                command
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .is_some_and(|command_type| !command_type.trim().is_empty())
     })
+}
+
+fn normalize_restricted_exec_command(command: &Value) -> Value {
+    let Some(map) = command.as_object() else {
+        return command.clone();
+    };
+    if map
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|command_type| !command_type.trim().is_empty())
+    {
+        return command.clone();
+    }
+
+    for command_type in ["rg", "readfile", "tree", "ls", "glob"] {
+        if let Some(normalized) = normalize_shorthand_command(command_type, map) {
+            return normalized;
+        }
+    }
+
+    if let Some(command_type) = infer_restricted_exec_command_type(map) {
+        let mut normalized = map.clone();
+        normalized.insert("type".to_string(), Value::String(command_type.to_string()));
+        return Value::Object(normalized);
+    }
+
+    command.clone()
+}
+
+fn infer_restricted_exec_command_type(map: &Map<String, Value>) -> Option<&'static str> {
+    if map.get("file").and_then(Value::as_str).is_some() {
+        return Some("readfile");
+    }
+    if map.get("pattern").and_then(Value::as_str).is_some()
+        && map.get("path").and_then(Value::as_str).is_some()
+    {
+        if map.get("type_filter").and_then(Value::as_str).is_some() {
+            return Some("glob");
+        }
+        return Some("rg");
+    }
+    if map.get("path").and_then(Value::as_str).is_some()
+        && map.get("levels").and_then(Value::as_i64).is_some()
+    {
+        return Some("tree");
+    }
+    if map.get("path").and_then(Value::as_str).is_some()
+        && (map.get("long_format").and_then(Value::as_bool).is_some()
+            || map.get("all").and_then(Value::as_bool).is_some())
+    {
+        return Some("ls");
+    }
+    None
+}
+
+fn normalize_shorthand_command(command_type: &str, map: &Map<String, Value>) -> Option<Value> {
+    let shorthand = map.get(command_type)?;
+    match shorthand {
+        Value::Object(inner) => {
+            let mut normalized = inner.clone();
+            normalized
+                .entry("type".to_string())
+                .or_insert_with(|| Value::String(command_type.to_string()));
+            Some(Value::Object(normalized))
+        }
+        Value::String(value) => {
+            let mut normalized = Map::new();
+            normalized.insert("type".to_string(), Value::String(command_type.to_string()));
+            let target_field = match command_type {
+                "rg" | "glob" => "pattern",
+                "readfile" => "file",
+                "tree" | "ls" => "path",
+                _ => return None,
+            };
+            normalized.insert(target_field.to_string(), Value::String(value.clone()));
+            for (key, value) in map {
+                if key != command_type {
+                    normalized.insert(key.clone(), value.clone());
+                }
+            }
+            Some(Value::Object(normalized))
+        }
+        _ => None,
+    }
 }
 
 fn format_restricted_exec_results(updates: &[InstantContextToolUpdate]) -> String {
@@ -842,6 +930,104 @@ mod tests {
         assert!(output.contains("command2_result:\nError: tool timed out"));
         assert!(!output.contains("status="));
         assert!(!output.contains("duration_ms="));
+    }
+
+    #[test]
+    fn restricted_exec_commands_keep_standard_command_shape() {
+        let args = serde_json::json!({
+            "command1": {
+                "type": "rg",
+                "pattern": "needle",
+                "path": "/codebase/src"
+            }
+        });
+
+        assert!(has_valid_restricted_exec_command(&args, 8));
+        let commands = restricted_exec_commands(&args, 8);
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].args, args["command1"]);
+    }
+
+    #[test]
+    fn restricted_exec_commands_normalize_model_shorthand_commands() {
+        let args = serde_json::json!({
+            "command1": {
+                "rg": {
+                    "pattern": "auth",
+                    "path": "/codebase/src",
+                    "exclude": ["test"]
+                }
+            },
+            "command2": {
+                "readfile": "/codebase/src/core.rs",
+                "start_line": 1,
+                "end_line": 10
+            },
+            "command3": {
+                "rg": "parse_answer",
+                "path": "/codebase/src/core"
+            },
+            "command4": {
+                "glob": "**/*.rs",
+                "path": "/codebase/src"
+            }
+        });
+
+        assert!(has_valid_restricted_exec_command(&args, 8));
+        let commands = restricted_exec_commands(&args, 8);
+
+        assert_eq!(commands.len(), 4);
+        assert_eq!(commands[0].args["type"], "rg");
+        assert_eq!(commands[0].args["pattern"], "auth");
+        assert_eq!(commands[0].args["path"], "/codebase/src");
+        assert_eq!(commands[1].args["type"], "readfile");
+        assert_eq!(commands[1].args["file"], "/codebase/src/core.rs");
+        assert_eq!(commands[1].args["start_line"], 1);
+        assert_eq!(commands[2].args["type"], "rg");
+        assert_eq!(commands[2].args["pattern"], "parse_answer");
+        assert_eq!(commands[2].args["path"], "/codebase/src/core");
+        assert_eq!(commands[3].args["type"], "glob");
+        assert_eq!(commands[3].args["pattern"], "**/*.rs");
+        assert_eq!(commands[3].args["path"], "/codebase/src");
+    }
+
+    #[test]
+    fn restricted_exec_commands_infer_missing_command_types_from_fields() {
+        let args = serde_json::json!({
+            "command1": {
+                "file": "/codebase/src/core.rs",
+                "start_line": 1,
+                "end_line": 10
+            },
+            "command2": {
+                "pattern": "parse_answer",
+                "path": "/codebase/src"
+            },
+            "command3": {
+                "pattern": "**/*.rs",
+                "path": "/codebase/src",
+                "type_filter": "file"
+            },
+            "command4": {
+                "path": "/codebase/src",
+                "levels": 2
+            },
+            "command5": {
+                "path": "/codebase/src",
+                "all": false
+            }
+        });
+
+        assert!(has_valid_restricted_exec_command(&args, 8));
+        let commands = restricted_exec_commands(&args, 8);
+
+        assert_eq!(commands.len(), 5);
+        assert_eq!(commands[0].args["type"], "readfile");
+        assert_eq!(commands[1].args["type"], "rg");
+        assert_eq!(commands[2].args["type"], "glob");
+        assert_eq!(commands[3].args["type"], "tree");
+        assert_eq!(commands[4].args["type"], "ls");
     }
 
     #[test]

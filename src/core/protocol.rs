@@ -1,6 +1,6 @@
 use crate::protobuf::{ProtobufEncoder, connect_frame_decode, extract_strings};
 use regex::Regex;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::env;
 
 use super::WS_APP;
@@ -192,9 +192,121 @@ fn parse_tool_call(text: &str) -> Option<(String, String, Value)> {
         end = raw.len();
     }
 
-    let args = serde_json::from_str::<Value>(&raw[..end]).ok()?;
+    let args = parse_tool_call_args(&name, &raw[..end])?;
     let thinking = text[..full_match.start()].trim().to_string();
     Some((thinking, name, args))
+}
+
+fn parse_tool_call_args(name: &str, raw: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .or_else(|| (name == "restricted_exec").then(|| repair_restricted_exec_args(raw))?)
+}
+
+fn repair_restricted_exec_args(raw: &str) -> Option<Value> {
+    let regex = Regex::new(r#""(command[1-8])"\s*:"#).ok()?;
+    let matches = regex
+        .captures_iter(raw)
+        .filter_map(|captures| {
+            let key = captures.get(1)?.as_str().to_string();
+            let full_match = captures.get(0)?;
+            Some((key, full_match.start(), full_match.end()))
+        })
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        return None;
+    }
+
+    let mut repaired = Map::new();
+    for (idx, (key, _, value_start)) in matches.iter().enumerate() {
+        let value_end = matches
+            .get(idx + 1)
+            .map(|(_, key_start, _)| *key_start)
+            .unwrap_or(raw.len());
+        if let Some(value) = repair_json_object_fragment(&raw[*value_start..value_end]) {
+            repaired.insert(key.clone(), value);
+        }
+    }
+
+    (!repaired.is_empty()).then_some(Value::Object(repaired))
+}
+
+fn repair_json_object_fragment(fragment: &str) -> Option<Value> {
+    let mut candidate = fragment
+        .trim()
+        .trim_end_matches(|ch: char| ch.is_whitespace() || ch == ',')
+        .to_string();
+    if candidate.is_empty() {
+        return None;
+    }
+
+    for _ in 0..=4 {
+        if let Ok(value) = serde_json::from_str::<Value>(&candidate) {
+            return value.as_object().is_some().then_some(value);
+        }
+        if let Some(completed) = complete_json_fragment(&candidate)
+            && let Ok(value) = serde_json::from_str::<Value>(&completed)
+        {
+            return value.as_object().is_some().then_some(value);
+        }
+        if !remove_last_non_ws_char(&mut candidate, '}') {
+            break;
+        }
+    }
+
+    None
+}
+
+fn complete_json_fragment(fragment: &str) -> Option<String> {
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in fragment.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' if stack.pop() != Some(ch) => return None,
+            '}' | ']' => {}
+            _ => {}
+        }
+    }
+    if in_string {
+        return None;
+    }
+
+    let mut completed = fragment.to_string();
+    for ch in stack.iter().rev() {
+        completed.push(*ch);
+    }
+    Some(completed)
+}
+
+fn remove_last_non_ws_char(value: &mut String, expected: char) -> bool {
+    let Some((idx, ch)) = value
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())
+    else {
+        return false;
+    };
+    if ch != expected {
+        return false;
+    }
+    value.truncate(idx);
+    true
 }
 
 fn parse_structured_tool_call(value: &Value) -> Option<ParsedModelTurn> {
@@ -306,106 +418,83 @@ pub(crate) fn parse_response(data: &[u8]) -> ParsedModelTurn {
     }
 }
 
-const SYSTEM_PROMPT_TEMPLATE: &str = r#"You are an expert software engineer, responsible for providing context to another engineer to solve a code issue in the current codebase. The user will present you with a description of the issue, and it is your job to provide a series of file paths with associated line ranges that contain ALL the information relevant to understand and correctly address the issue.
-# IMPORTANT:
-- A relevant file does not mean only the files that must be modified to solve the task. It means any file that contains information relevant to planning and implementing the fix, such as the definitions of classes and functions that are relevant to the pieces of code that will have to be modified.
-- You should include enough context around the relevant lines to allow the engineer to understand the task correctly. You must include ENTIRE semantic blocks (functions, classes, definitions, etc). For example:
-If addressing the issue requires modifying a method within a class, then you should include the entire class definition, not just the lines around the method we want to modify.
-- NEVER truncate these blocks unless they are very large (hundreds of lines or more, in which case providing only a relevant portion of the block is acceptable).
-- Your job is to essentially alleviate the job of the other engineer by giving them a clean starting context from which to start working. More precisely, you should minimize the number of files the engineer has to read to understand and solve the task correctly (while not providing irrelevant code snippets).
+const SYSTEM_PROMPT_TEMPLATE: &str = r#"Search the codebase based on the user's question and provide a concise, accurate set of file paths and relevant line ranges containing all information needed to understand and correctly solve the issue.
+
+# OBJECTIVE
+
+* Return a minimal but precise set of relevant files that include the implementations, definitions, callers, configuration, tests, and entry points needed to plan or verify changes.
+* Prioritize complete semantic blocks, such as functions, classes, implementations, or modules. If a block is too large, trim it as needed while preserving meaning.
+* Provide enough code-related context to ensure the relevant mechanisms can be correctly understood.
+* Exclude irrelevant code snippets to avoid polluting the context, but do not reduce the result set merely for the sake of reduction.
+* Draw conclusions from the actual code. If a command fails or the returned evidence is insufficient, try different tool queries to obtain the answer.
+
 # ENVIRONMENT
-- Working directory: /codebase. Make sure to run commands in this directory, not `.`.
-- Tool access: use the restricted_exec tool ONLY
-- Allowed sub-commands (schema-enforced):
-  - rg: Search for patterns in files using ripgrep
-    - Required: pattern (string), path (string)
-    - Optional: include (array of globs), exclude (array of globs)
-  - readfile: Read contents of a file with optional line range
-    - Required: file (string)
-    - Optional: start_line (int), end_line (int)
- 1-indexed, inclusive
-  - tree: Display directory structure as a tree
-    - Required: path (string)
-    - Optional: levels (int)
-  - ls: List files in a directory
-    - Required: path (string)
-    - Optional: long_format (bool), all (bool)
-  - glob: Find files matching a glob pattern
-    - Required: pattern (string), path (string)
-    - Optional: type_filter ("file" | "directory" | "all")
-# THINKING RULES
-- Think step-by-step. Plan, reason, and reflect before each tool call.
-- Use tool calls liberally and purposefully to ground every conclusion in real code, not assumptions.
-- If a command fails, rethink and try something different; do not complain to the user.
-# FAST-SEARCH DEFAULTS (optimize rg/tree on large repos)
-- Start NARROW, then widen only if needed. Prefer searching likely code roots first (e.g., `src/`, `lib/`, `app/`, `packages/`, `services/`, `slime/`) instead of `/codebase`.
-- Prefer fixed-string search for literals: escape patterns or keep regex simple. Use smart case; avoid case-insensitive unless necessary.
-- Prefer file-type filters and globs (in include) over full-repo scans.
-- Default EXCLUDES for speed (apply via the exclude array): node_modules, .git, dist, build, coverage, .venv, venv, target, out, .cache, __pycache__, vendor, deps, third_party, logs, data, *.min.*
-- Skip huge files where possible; when opening files, prefer reading only relevant ranges with readfile.
-- Limit directory traversal with tree levels to quickly orient before deeper inspection.
-# SOME EXAMPLES OF WORKFLOWS
-- MAP
- Use `tree` or `ls` on likely roots; `rg` to grasp structure and hotspots.
-- ANCHOR
- `rg` for problem keywords and anchor symbols; use `glob` or include globs to narrow candidate files.
-- TRACE
- Follow imports with targeted `rg` in narrowed roots; open files with `readfile` scoped to entire semantic blocks.
-- VERIFY
- Confirm each candidate path exists by reading or additional searches; drop false positives (tests, vendored, generated) unless they must change.
+
+* Working directory: /codebase. Make sure to run commands in this directory, not `.`.
+* Allowed sub-commands:
+
+  * rg: Search for patterns in files.
+  * readfile: Read the contents of a file, optionally within a line range.
+  * tree: Display the directory structure as a tree.
+  * ls: List files in a directory.
+  * glob: Find files matching a glob pattern.
+
 # TOOL USE GUIDELINES
-- You must use a SINGLE restricted_exec call in your answer, that lets you execute at most {max_commands} commands in a single turn. Each command must be an object with a `type` field of `rg`, `readfile`, `tree`, `ls`, or `glob` and the appropriate fields for that type.
-- Example restricted_exec usage:
+
+* Use at most {max_commands} `restricted_exec` commands. Each command `type` must be one of `rg`, `readfile`, `tree`, `ls`, or `glob`.
+* Each command object must put the command type in the top-level `type` field. Do not wrap commands as `{"rg": {...}}`, `{"readfile": "path"}`, or omit `type`.
+* You have at most {max_turns} turns to interact with the environment by calling tools, so parallel commands are encouraged.
+* `restricted_exec` arguments must have this shape:
+
 [TOOL_CALLS]restricted_exec[ARGS]{
   "command1": {
     "type": "rg",
     "pattern": "Controller",
-    "path": "/codebase/slime",
-    "include": ["**/*.py"],
-    "exclude": ["**/node_modules/**", "**/.git/**", "**/dist/**", "**/build/**", "**/.venv/**", "**/__pycache__/**"]
+    "path": "/codebase/src",
+    "include": ["**/*.py"]
   },
   "command2": {
     "type": "readfile",
-    "file": "/codebase/slime/train.py",
+    "file": "/codebase/src/controller.py",
     "start_line": 1,
     "end_line": 200
   },
   "command3": {
     "type": "tree",
-    "path": "/codebase/slime/",
+    "path": "/codebase/src",
     "levels": 2
   },
   "command4": {
-    "type": "glob",
-    "pattern": "**/*.py",
-    "path": "/codebase/slime/",
-    "type_filter": "file"
+    "type": "ls",
+    "path": "/codebase/src",
+    "all": false
   },
   "command5": {
-    "type": "ls",
-    "path": "/codebase/slime/",
-    "all": false
+    "type": "glob",
+    "pattern": "**/*.rs",
+    "path": "/codebase/src",
+    "type_filter": "file"
   }
 }
-- You have at most {max_turns} turns to interact with the environment by calling tools, so issuing multiple commands at once is necessary and encouraged to speed up your research.
-- Each command result may be truncated by tool-specific output limits; prefer multiple targeted reads/searches to build complete context.
-- DO NOT EVER USE MORE THAN {max_commands} commands in a single turn, or you will be penalized.
-# ANSWER FORMAT (strict format, including tags)
-- You will output an XML structure with a root element "ANSWER" containing "file" elements. Each "file" element will have a "path" attribute and contain "range" elements.
-- You will output this as your final response.
-- The line ranges must be inclusive.
-Output example inside the "answer" tool argument:
-<ANSWER>
-  <file path="/codebase/info_theory/formulas/entropy.py">
-    <range>10-60</range>
-    <range>150-210</range>
-  </file>
-  <file path="/codebase/info_theory/data_structures/bits.py">
-    <range>1-40</range>
-    <range>110-170</range>
-  </file>
-</ANSWER>
-Remember: Prefer narrow, fixed-string, and type-filtered searches with aggressive excludes and size/depth limits. Widen scope only as needed. Use the restricted tools available to you, and output your answer in exactly the specified format.
+
+# ANSWER FORMAT
+
+Strictly follow this format, including the tags.
+
+* Use the answer tool with XML rooted at `ANSWER`.
+* Each `file` element must have a `path` attribute.
+* Each file must contain one or more inclusive `range` elements.
+* Example output inside the answer tool argument:
+
+<ANSWER><file path="/codebase/src/auth.rs"><range>10-80</range></file></ANSWER>
+
+# NO RESULTS POLICY
+
+If, after thorough searching, you are confident that no relevant files exist for the given query, such as when the requested function, class, or concept does not exist in the codebase, you MUST return an empty `ANSWER`:
+
+<ANSWER></ANSWER>
+
+Do NOT return irrelevant files, such as entry points or configuration files, merely to provide some output. An empty answer is always better than a misleading one.
 "#;
 
 pub(crate) const FINAL_FORCE_ANSWER: &str =
@@ -556,22 +645,27 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_uses_windsurf_context_subagent_contract() {
+    fn build_system_prompt_contains_required_protocol_keywords() {
         let prompt = build_system_prompt(3, 6, 5);
 
-        assert!(prompt.contains("You are an expert software engineer"));
-        assert!(prompt.contains("Tool access: use the restricted_exec tool ONLY"));
-        assert!(prompt.contains("/codebase"));
-        assert!(prompt.contains("ANSWER FORMAT"));
-        assert!(prompt.contains("at most 6 commands"));
-        assert!(prompt.contains("at most 3 turns"));
-        assert!(prompt.contains("Think step-by-step"));
-        assert!(prompt.contains("DO NOT EVER USE MORE THAN 6 commands"));
-        assert!(prompt.contains("ls: List files in a directory"));
-        assert!(prompt.contains("glob: Find files matching a glob pattern"));
-        assert!(prompt.contains("[TOOL_CALLS]restricted_exec[ARGS]"));
-        assert!(!prompt.contains("task_boundary"));
-        assert!(!prompt.contains("notify_user"));
+        for keyword in [
+            "/codebase",
+            "restricted_exec",
+            "answer",
+            "ANSWER",
+            "rg",
+            "readfile",
+            "tree",
+            "ls",
+            "glob",
+            "6",
+            "3",
+        ] {
+            assert!(prompt.contains(keyword), "missing keyword: {keyword}");
+        }
+        assert!(!prompt.contains("{max_commands}"));
+        assert!(!prompt.contains("{max_turns}"));
+        assert!(!prompt.contains("{max_results}"));
     }
 
     #[test]
@@ -627,6 +721,29 @@ mod tests {
         assert_eq!(calls[0].name, "restricted_exec");
         assert_eq!(calls[0].args["command1"]["type"], "rg");
         assert_eq!(calls[0].args["command1"]["pattern"], "main");
+    }
+
+    #[test]
+    fn parse_response_repairs_restricted_exec_command_fragments() {
+        let mut encoder = ProtobufEncoder::new();
+        encoder.write_string(1, "thinking");
+        encoder.write_string(
+            2,
+            r#"[TOOL_CALLS]restricted_exec[ARGS]{"command1":{"rg":{"pattern":"SearchResult","path":"/codebase/src"},"command2":{"file":"/codebase/src/core.rs","start_line":1,"end_line":20}"#,
+        );
+        let frame = connect_frame_encode(&encoder.to_bytes(), false);
+
+        let ParsedModelTurn::ToolCalls { calls, .. } = parse_response(&frame) else {
+            panic!("expected repaired tool call");
+        };
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "restricted_exec");
+        assert_eq!(calls[0].args["command1"]["rg"]["pattern"], "SearchResult");
+        assert_eq!(calls[0].args["command1"]["rg"]["path"], "/codebase/src");
+        assert_eq!(calls[0].args["command2"]["file"], "/codebase/src/core.rs");
+        assert_eq!(calls[0].args["command2"]["start_line"], 1);
+        assert_eq!(calls[0].args["command2"]["end_line"], 20);
     }
 
     #[test]
